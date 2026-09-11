@@ -1,0 +1,222 @@
+// diffrender_tests.nv — the bytes, and the rows somebody else paints.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE `diff -u`'s OWN.  A unified diff is an interchange
+// format — `patch(1)` and `git apply` both read it — so the header
+// tests are byte comparisons against what GNU diffutils writes, taken
+// from its `tests/` corpus, and not against what looks reasonable.
+// The three rules that catch every hand-rolled renderer are each their
+// own case: the count is omitted when it is 1, the start is 0 for an
+// empty range, and the `\ No newline at end of file` marker follows
+// the line it qualifies rather than ending the hunk.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use diffunit
+use diffscript
+use diffrender
+
+fn script_of(a: Str, b: Str) -> diffscript.DiffScript
+    diffscript.diff(diffunit.tokenize(a, b, DiffLines),
+                    diffscript.minimal_options())
+
+fn render(a: Str, b: Str, context: Int) -> Str
+    let input = diffunit.tokenize(a, b, DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    diffrender.unified(input, s, diffrender.unified_options(context))
+
+@test
+fn test_the_hunk_header_is_diff_us_byte_for_byte() [io]
+    test.case("a one-line range writes no count — @@ -1 +1 @@, not @@ -1,1 +1,1 @@")
+    let one = render("a\n", "b\n", 0)
+    test.assert(str.index(one, "@@ -1 +1 @@") != None)
+
+    test.case("a multi-line range writes the count")
+    let many = render("a\nb\nc\n", "x\ny\nz\n", 0)
+    test.assert(str.index(many, "@@ -1,3 +1,3 @@") != None)
+
+    test.case("an empty range starts at 0 — a pure insertion into an empty file")
+    let ins = render("", "a\n", 0)
+    test.assert(str.index(ins, "@@ -0,0 +1 @@") != None)
+
+    test.case("and a pure deletion says so on the other side")
+    let del = render("a\n", "", 0)
+    test.assert(str.index(del, "+0,0") != None)
+
+@test
+fn test_the_file_headers_are_the_callers_strings_and_nothing_else() [io]
+    let input = diffunit.tokenize("a\n", "b\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("the names are written as given, with no a/ and b/ invented")
+    let named = diffrender.unified(input, s,
+                                   diffrender.unified_options_named(3, "old.txt", "new.txt"))
+    test.assert(str.index(named, "--- old.txt") != None)
+    test.assert(str.index(named, "+++ new.txt") != None)
+
+    test.case("an empty stamp writes the name alone — no trailing tab")
+    test.assert(str.index(named, "--- old.txt\t") == None)
+
+@test
+fn test_the_no_newline_marker_follows_the_line_it_qualifies() [io]
+    test.case("a left side with no final newline marks the removed line")
+    let r = render("a", "a\n", 0)
+    test.assert(str.index(r, "\\ No newline at end of file") != None)
+
+    test.case("the tokeniser is what knows it — the last token is unterminated")
+    let input = diffunit.tokenize("a", "a\n", DiffLines)
+    test.assert(diffunit.token_unterminated(input.a, 0))
+    test.assert(not diffunit.token_unterminated(input.b, 0))
+
+    test.case("and a file that ends in a newline carries no marker at all")
+    let clean = render("a\n", "b\n", 0)
+    test.assert(str.index(clean, "\\ No newline") == None)
+
+@test
+fn test_the_row_list_is_what_an_editor_paints() [io]
+    let input = diffunit.tokenize("keep\nold\n", "keep\nnew\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let rows = diffrender.lines(input, s, 3)
+
+    test.case("one row per displayed line")
+    test.assert(list.len(rows) == 3)
+
+    test.case("a context row carries both line numbers")
+    var ctx = 0
+    for row in rows
+        match row.kind
+            DiffLineContext =>
+                if row.a_line > 0 and row.b_line > 0
+                    ctx = ctx + 1
+            _               =>
+                pass
+    test.assert(ctx == 1)
+
+    test.case("a removed row carries a left line number and no right one")
+    var removed = 0
+    for row in rows
+        match row.kind
+            DiffLineRemoved =>
+                if row.a_line == 2 and row.b_line == 0
+                    removed = removed + 1
+            _               =>
+                pass
+    test.assert(removed == 1)
+
+    test.case("a row's span is read out of the side its kind names, and is the line's bytes")
+    for row in rows
+        match row.kind
+            DiffLineAdded =>
+                test.assert(diffunit.span_str(input.b, row.span) == "new\n")
+            _             =>
+                pass
+
+    test.case("a context line that BEGINS with a minus is still a context row")
+    let tricky = diffunit.tokenize("-x\nold\n", "-x\nnew\n", DiffLines)
+    let ts = diffscript.diff(tricky, diffscript.minimal_options())
+    let trows = diffrender.lines(tricky, ts, 3)
+    var first_is_context = false
+    for row in trows
+        match row.kind
+            DiffLineContext =>
+                if row.a_line == 1
+                    first_is_context = true
+            _               =>
+                pass
+    test.assert(first_is_context)
+
+@test
+fn test_the_buffer_form_appends_and_never_replaces() [io]
+    let input = diffunit.tokenize("a\n", "b\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let seed: [u8] = [104, 105]
+
+    test.case("what was already in the buffer is still at the front")
+    let out = diffrender.unified_into(seed, input, s, diffrender.unified_options(0))
+    test.assert(out[0] == 104)
+    test.assert(out[1] == 105)
+    test.assert(list.len(out) > 2)
+
+@test
+fn test_side_by_side_measures_columns_with_the_callers_width_function() [io]
+    fn ascii_width(cluster: Str) -> Int
+        1
+
+    let input = diffunit.tokenize("aaa\n", "bbb\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let o = diffrender.column_options(10, ascii_width)
+
+    test.case("the options carry the function the caller named")
+    test.assert(o.width == 10)
+
+    test.case("and the layout uses it rather than counting bytes")
+    let empty: [u8] = []
+    let out = diffrender.side_by_side_into(empty, input, s, o)
+    test.assert(list.len(out) > 0)
+
+@test
+fn test_the_stat_line_is_gits_wording() [io]
+    test.case("one insertion and one deletion, in git's own words")
+    let empty: [u8] = []
+    let out = diffrender.stat_line_into(empty, "a.txt", 1, 1)
+    let text = bytes.byte_list_to_str(out)
+    test.assert(str.index(text, "1 insertion(+)") != None)
+    test.assert(str.index(text, "1 deletion(-)") != None)
+
+@test
+fn test_the_writer_form_is_charged_what_the_callers_sink_costs() [io]
+    let input = diffunit.tokenize("a\n", "b\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("an in-memory Buffer is a Write[] — the whole call costs nothing")
+    let sink = Buffer.new(64)
+    let err = diffrender.unified_to(sink, input, s, diffrender.unified_options(0))
+    test.assert(err == None)
+
+    test.case("and the same call rendered the same bytes the string form does")
+    test.assert(sink.len() > 0)
+
+    test.case("side_by_side_to takes the same sink")
+    let sink2 = Buffer.new(64)
+    let err2 = diffrender.side_by_side_to(sink2, input, s,
+                                          diffrender.column_options(10, ascii_width))
+    test.assert(err2 == None)
+
+@test
+fn test_the_header_can_be_written_without_the_body() [io]
+    let input = diffunit.tokenize("a\nb\nc\n", "a\nX\nc\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let hs = diffscript.hunks(s, 1)
+
+    test.case("hunk_header_into writes the @@ line alone, for a caller rendering its own body")
+    let empty: [u8] = []
+    let out = diffrender.hunk_header_into(empty, hs[0], "")
+    let text = bytes.byte_list_to_str(out)
+    test.assert(str.index(text, "@@ -1,3 +1,3 @@") != None)
+
+    test.case("a section heading is written after the second @@, as diff -p does")
+    let out2 = diffrender.hunk_header_into(empty, hs[0], "fn main()")
+    let text2 = bytes.byte_list_to_str(out2)
+    test.assert(str.index(text2, "@@ fn main()") != None)
+
+@test
+fn test_inline_marks_are_spans_and_not_markers_in_a_string() [io]
+    let input = diffunit.tokenize("the quick brown fox\n", "the quick red fox\n",
+                                  DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("the refined script answers the two sides' changed spans separately")
+    for op in s.ops
+        match op
+            DiffReplace(a, b) =>
+                let refined = diffscript.refine(input, DiffReplace(a, b), DiffWords,
+                                                diffscript.minimal_options())
+                let marks = diffrender.inline_marks(input, refined, DiffReplace(a, b))
+                test.assert(list.len(marks.0) > 0)
+                test.assert(list.len(marks.1) > 0)
+            _                 =>
+                pass

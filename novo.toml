@@ -1,0 +1,51 @@
+[package]
+name        = "diff-nv"
+version     = "0.0.1"
+description = "Myers, patience and histogram diff over lines, words or grapheme clusters, answered as an edit script of typed operations over TOKEN INDICES with the byte spans kept beside them; unified and side-by-side rendering into a caller's buffer with `diff -u`'s own `@@` headers; unified-patch parsing and application with fuzz and a reject list; and a three-way merge that answers its conflicts as values as well as markers.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A diff is arithmetic over two strings the caller already
+# holds: nothing is read, nothing is written, no clock is consulted,
+# and no text is copied out of either input until a renderer is asked
+# for bytes.  The one place a stream could have entered — writing a
+# rendered diff to stdout or a file — is an effect-polymorphic
+# function (`diffrender.unified_to<W: Write[e]>`), which is charged
+# what the caller's writer costs and spends nothing of its own.
+layer       = "core"
+
+category    = "text"
+
+tags        = ["diff", "myers", "patience", "histogram", "patch", "merge", "unified", "similar", "difflib", "sans-io"]
+repository  = "https://github.com/novolang/diff-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "An edit script over token indices, and the four things that read one"
+
+[dependencies]
+# unicode-nv, for ONE granularity and one rule.
+#
+# `DiffGraphemes` is a diff whose tokens are extended grapheme
+# clusters, and a cluster boundary is UAX #29's — a family emoji and a
+# combining accent are each one token, so a character-level diff does
+# not cut a codepoint sequence in half and hand a renderer bytes that
+# do not print.  `ugrapheme.next_boundary` is exactly that scan.
+#
+# `DiffWords` uses `ugrapheme.words`, UAX #29's word boundaries, so a
+# word diff of Japanese or of `foo_bar-baz` splits where a reader
+# would split it rather than where ASCII whitespace happens to be.
+#
+# Nothing else in this package needs it: the algorithms are over
+# `[Int]` token ids and never look at text at all.
+unicode-nv = "^0.0.1"

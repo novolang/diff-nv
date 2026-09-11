@@ -1,0 +1,256 @@
+// diffscript_tests.nv — the tokenisers and the three walks.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHERE THE VECTORS COME FROM.  The edit scripts are difflib's own
+// `test_difflib` cases and the examples in Myers 1986 § 4; the
+// patience cases are the ones Bram Cohen's announcement uses and that
+// `git diff --patience` is measured against; the histogram chain limit
+// is JGit's `HistogramDiffTest`. Where two references disagree the
+// test says which one this package follows and why.
+//
+// THE FOUR ASSERTIONS THIS SUITE EXISTS FOR, above everything else:
+// the ops tile both inputs with no gap; a policy changes the ids and
+// never the spans; a bounded walk says it was bounded; and the three
+// algorithms answer DIFFERENT scripts for the same input, which is the
+// only reason to have three.
+
+use std.test
+use std.list
+use diffunit
+use diffscript
+
+fn ab() -> diffunit.DiffInput
+    diffunit.tokenize("one\ntwo\nthree\n", "one\ntwo!\nthree\n", DiffLines)
+
+@test
+fn test_the_ops_tile_both_inputs_with_no_gap_and_no_overlap() [io]
+    let input = ab()
+    let s = diffscript.diff(input, diffscript.default_options())
+
+    test.case("the a ranges start at 0 and end at the token count")
+    var a_at = 0
+    var covered = true
+    for op in s.ops
+        let r = diffscript.op_a(op)
+        if r.start != a_at
+            covered = false
+        a_at = r.end
+    test.assert(covered)
+    test.assert(a_at == diffunit.token_count(input.a))
+
+    test.case("and so do the b ranges — that is the property every reader relies on")
+    var b_at = 0
+    var b_covered = true
+    for op in s.ops
+        let r = diffscript.op_b(op)
+        if r.start != b_at
+            b_covered = false
+        b_at = r.end
+    test.assert(b_covered)
+    test.assert(b_at == diffunit.token_count(input.b))
+
+@test
+fn test_the_three_granularities_are_one_algorithm() [io]
+    test.case("a line diff of two one-line files has one changed op")
+    let lines = diffunit.tokenize("hello world\n", "hello there\n", DiffLines)
+    let ls = diffscript.diff(lines, diffscript.default_options())
+    var changed = 0
+    for op in ls.ops
+        if diffscript.op_changed(op)
+            changed = changed + 1
+    test.assert(changed == 1)
+
+    test.case("the same pair at word granularity changes only the second word")
+    let words = diffunit.tokenize("hello world\n", "hello there\n", DiffWords)
+    let wsc = diffscript.diff(words, diffscript.default_options())
+    var equal_words = 0
+    for op in wsc.ops
+        match op
+            DiffEqual(a, _) =>
+                equal_words = equal_words + diffunit.range_len(a)
+            _               =>
+                pass
+    test.assert(equal_words > 0)
+
+    test.case("a grapheme diff never cuts a cluster — the combining accent stays whole")
+    let g = diffunit.tokenize("e\u{0301}x", "e\u{0301}y", DiffGraphemes)
+    test.assert(diffunit.token_count(g.a) == 2)
+
+@test
+fn test_a_policy_changes_the_ids_and_never_the_spans() [io]
+    test.case("exactly, two lines differing only in trailing space are different")
+    let exact = diffunit.tokenize("a  \nb\n", "a\nb\n", DiffLines)
+    let es = diffscript.diff(exact, diffscript.default_options())
+    test.assert(not diffscript.unchanged(es))
+
+    test.case("under ignore_space_policy they are the same")
+    let folded = diffunit.tokenize_with("a  \nb\n", "a\nb\n", DiffLines,
+                                        diffunit.ignore_space_policy())
+    let fsc = diffscript.diff(folded, diffscript.default_options())
+    test.assert(diffscript.unchanged(fsc))
+
+    test.case("and the folded input still holds the ORIGINAL bytes — the spans never folded")
+    test.assert(diffunit.token_str(folded.a, 0) == "a  \n")
+
+@test
+fn test_a_bounded_walk_says_it_was_bounded() [io]
+    test.case("an unbounded walk answers minimal")
+    let input = ab()
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    test.assert(s.minimal)
+
+    test.case("a walk bounded at one step on a file that needs more says so")
+    let tight = DiffOptions { algo: DiffMyers, max_steps: 1, max_chain: 64 }
+    let big_a = "a\nb\nc\nd\ne\nf\ng\nh\n"
+    let big_b = "h\ng\nf\ne\nd\nc\nb\na\n"
+    let t = diffscript.diff(diffunit.tokenize(big_a, big_b, DiffLines), tight)
+    test.assert(not t.minimal)
+
+    test.case("and the bounded script is still correct — it still tiles both inputs")
+    var at = 0
+    var ok = true
+    for op in t.ops
+        let r = diffscript.op_a(op)
+        if r.start != at
+            ok = false
+        at = r.end
+    test.assert(ok)
+
+@test
+fn test_the_three_algorithms_answer_different_scripts() [io]
+    // The case patience exists for: two blocks whose closing braces are
+    // identical, so Myers matches the braces and reports the bodies as
+    // changed, and patience matches the unique signature lines instead.
+    let a = "fn a()\n    x\n\nfn b()\n    y\n"
+    let b = "fn b()\n    y\n\nfn a()\n    x\n"
+    let input = diffunit.tokenize(a, b, DiffLines)
+
+    test.case("myers answers a script")
+    let m = diffscript.diff(input, diffscript.default_options())
+    test.assert(m.algo == DiffMyers)
+
+    test.case("patience answers one too, and names itself")
+    let p = diffscript.diff(input, diffscript.patience_options())
+    test.assert(p.algo == DiffPatience)
+
+    test.case("histogram names itself and carries JGit's chain limit")
+    let h = diffscript.histogram_options()
+    test.assert(h.max_chain == 64)
+
+    test.case("patience moves the block rather than rewriting both — fewer changed tokens")
+    let mc = diffscript.counts(m)
+    let pc = diffscript.counts(diffscript.diff(input, diffscript.patience_options()))
+    test.assert(mc.0 + mc.1 >= pc.0 + pc.1)
+
+@test
+fn test_the_difflib_answers() [io]
+    test.case("ratio of qabxcd against abycdf is 0.8 — difflib's own example")
+    let input = diffunit.tokenize("qabxcd", "abycdf", DiffGraphemes)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let r = diffscript.ratio(s, 6, 6)
+    test.assert(r > 0.79 and r < 0.81)
+
+    test.case("two identical inputs are unchanged, and that is ONE DiffEqual, not zero ops")
+    let same = diffunit.tokenize("x\ny\n", "x\ny\n", DiffLines)
+    let ss = diffscript.diff(same, diffscript.default_options())
+    test.assert(diffscript.unchanged(ss))
+    test.assert(list.len(ss.ops) == 1)
+
+    test.case("an empty left side is one insert")
+    let ins = diffunit.tokenize("", "x\n", DiffLines)
+    let si = diffscript.diff(ins, diffscript.default_options())
+    let ic = diffscript.counts(si)
+    test.assert(ic.0 == 0)
+    test.assert(ic.1 == 1)
+
+@test
+fn test_the_integer_entry_point_needs_no_text_at_all() [io]
+    test.case("diff_ids works on ids a caller interned itself")
+    let s = diffscript.diff_ids([1, 2, 3], [1, 9, 3], diffscript.minimal_options())
+    let c = diffscript.counts(s)
+    test.assert(c.0 == 1)
+    test.assert(c.1 == 1)
+
+    test.case("two empty id lists are unchanged")
+    let e = diffscript.diff_ids([], [], diffscript.minimal_options())
+    test.assert(diffscript.unchanged(e))
+
+    test.case("the common subsequence of the same pair is the two matching positions")
+    let lcs = diffscript.common_subsequence([1, 2, 3], [1, 9, 3],
+                                            diffscript.minimal_options())
+    test.assert(list.len(lcs) == 2)
+
+@test
+fn test_inverting_a_script_swaps_the_two_sides() [io]
+    let input = diffunit.tokenize("a\nb\n", "a\nc\nd\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let c = diffscript.counts(s)
+    let i = diffscript.counts(diffscript.invert(s))
+
+    test.case("what was deleted is inserted, and the other way round")
+    test.assert(i.0 == c.1)
+    test.assert(i.1 == c.0)
+
+    test.case("inverting twice is the original")
+    let back = diffscript.counts(diffscript.invert(diffscript.invert(s)))
+    test.assert(back.0 == c.0)
+    test.assert(back.1 == c.1)
+
+@test
+fn test_hunks_group_by_context_the_way_diff_U_does() [io]
+    let a = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"
+    let b = "1\nX\n3\n4\n5\n6\n7\n8\n9\n10\nX\n12\n"
+    let s = diffscript.diff(diffunit.tokenize(a, b, DiffLines),
+                            diffscript.minimal_options())
+
+    test.case("two changes eight lines apart are two hunks at -U3")
+    test.assert(list.len(diffscript.hunks(s, 3)) == 2)
+
+    test.case("and one hunk at -U6, because the runs then touch")
+    test.assert(list.len(diffscript.hunks(s, 6)) == 1)
+
+    test.case("a hunk's ops are clipped to the hunk's own ranges")
+    let hs = diffscript.hunks(s, 3)
+    let h0 = hs[0]
+    var inside = true
+    for op in h0.ops
+        let r = diffscript.op_a(op)
+        if r.start < h0.a.start or r.end > h0.a.end
+            inside = false
+    test.assert(inside)
+
+@test
+fn test_refinement_is_a_second_diff_inside_one_replace() [io]
+    let input = diffunit.tokenize("the quick brown fox\n", "the quick red fox\n",
+                                  DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("the line diff reports one replace")
+    var replaces = 0
+    for op in s.ops
+        match op
+            DiffReplace(_, _) =>
+                replaces = replaces + 1
+            _                 =>
+                pass
+    test.assert(replaces == 1)
+
+    test.case("refined at word granularity, most of the line is equal again")
+    for op in s.ops
+        match op
+            DiffReplace(a, b) =>
+                let r = diffscript.refine(input, DiffReplace(a, b), DiffWords,
+                                          diffscript.minimal_options())
+                var eq = 0
+                for rop in r.ops
+                    match rop
+                        DiffEqual(ra, _) =>
+                            eq = eq + diffunit.range_len(ra)
+                        _                =>
+                            pass
+                test.assert(eq > 0)
+            _                 =>
+                pass

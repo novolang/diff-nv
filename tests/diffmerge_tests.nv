@@ -1,0 +1,214 @@
+// diffmerge_tests.nv — three inputs, one output, conflicts as values.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE git's `t6xxx` MERGE TESTS and `diff3`'s own
+// testsuite: the clean cases, the both-changed case, the add/add case,
+// and the delete/modify case that every merge implementation gets
+// wrong at least once.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: the conflicts come back as
+// values with ranges into all three inputs, and asking whether a merge
+// is clean never requires rendering it or parsing the rendering back.
+// The last case is the one that proves it matters — a file whose own
+// content contains marker lines.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use diffmerge
+use diffunit
+use diffscript
+
+@test
+fn test_a_change_on_one_side_only_merges_clean() [io]
+    let base = "one\ntwo\nthree\n"
+
+    test.case("ours changed, theirs did not")
+    let a = diffmerge.merge3(base, "ONE\ntwo\nthree\n", base, diffmerge.merge_options())
+    test.assert(diffmerge.clean(a))
+    test.assert(a.text == "ONE\ntwo\nthree\n")
+
+    test.case("theirs changed, ours did not")
+    let b = diffmerge.merge3(base, base, "one\ntwo\nTHREE\n", diffmerge.merge_options())
+    test.assert(diffmerge.clean(b))
+    test.assert(b.text == "one\ntwo\nTHREE\n")
+
+    test.case("both changed, in different places")
+    let c = diffmerge.merge3(base, "ONE\ntwo\nthree\n", "one\ntwo\nTHREE\n",
+                             diffmerge.merge_options())
+    test.assert(diffmerge.clean(c))
+    test.assert(c.text == "ONE\ntwo\nTHREE\n")
+    test.assert(c.merged == 2)
+
+@test
+fn test_both_sides_changing_one_line_is_a_conflict_with_three_ranges() [io]
+    let r = diffmerge.merge3("one\ntwo\nthree\n",
+                             "one\nOURS\nthree\n",
+                             "one\nTHEIRS\nthree\n",
+                             diffmerge.merge_options())
+
+    test.case("not clean")
+    test.assert(not diffmerge.clean(r))
+
+    test.case("one conflict")
+    test.assert(list.len(r.conflicts) == 1)
+
+    test.case("and it names the base range as well as the two sides")
+    let c = r.conflicts[0]
+    test.assert(diffunit.range_len(c.base) == 1)
+    test.assert(diffunit.range_len(c.ours) == 1)
+    test.assert(diffunit.range_len(c.theirs) == 1)
+    test.assert(not c.resolved)
+
+    test.case("the ranges read back against the same tokenisation merge3 used")
+    let toks = diffmerge.merge_tokens("one\ntwo\nthree\n",
+                                      "one\nOURS\nthree\n",
+                                      "one\nTHEIRS\nthree\n",
+                                      diffmerge.merge_options())
+    test.assert(diffunit.token_str(toks.0, c.base.start) == "two\n")
+    test.assert(diffunit.token_str(toks.1, c.ours.start) == "OURS\n")
+    test.assert(diffunit.token_str(toks.2, c.theirs.start) == "THEIRS\n")
+
+@test
+fn test_asking_whether_a_merge_is_clean_renders_nothing() [io]
+    test.case("conflicts_only answers an empty list for a clean merge")
+    let clean = diffmerge.conflicts_only("a\n", "a\nb\n", "a\n",
+                                         diffmerge.merge_options())
+    test.assert(list.len(clean) == 0)
+
+    test.case("and the conflicts for a dirty one, with no text produced")
+    let dirty = diffmerge.conflicts_only("a\n", "X\n", "Y\n",
+                                         diffmerge.merge_options())
+    test.assert(list.len(dirty) == 1)
+
+@test
+fn test_the_marker_styles_are_gits_three() [io]
+    let base = "one\ntwo\nthree\n"
+    let ours = "one\nOURS\nthree\n"
+    let theirs = "one\nTHEIRS\nthree\n"
+
+    test.case("two-sided writes the open, the divider and the close")
+    let two = diffmerge.merge3(base, ours, theirs, diffmerge.merge_options())
+    test.assert(str.index(two.text, "<<<<<<<") != None)
+    test.assert(str.index(two.text, "=======") != None)
+    test.assert(str.index(two.text, ">>>>>>>") != None)
+
+    test.case("and does NOT write the base")
+    test.assert(str.index(two.text, "|||||||") == None)
+
+    test.case("diff3 writes the base, and the labels the caller named")
+    let o3 = diffmerge.diff3_options("ancestor", "mine", "yours")
+    let three = diffmerge.merge3(base, ours, theirs, o3)
+    test.assert(str.index(three.text, "|||||||") != None)
+    test.assert(str.index(three.text, "mine") != None)
+    test.assert(str.index(three.text, "yours") != None)
+
+    test.case("markers() is what a working-tree scanner should look for, not seven hard-coded <")
+    let m = diffmerge.markers(diffmerge.merge_options())
+    test.assert(str.len(m.0) >= 7)
+
+@test
+fn test_marker_size_exists_for_a_file_that_contains_markers() [io]
+    // A file documenting merge conflicts. Merging it at the default
+    // marker size produces output no tool can read back.
+    let base = "intro\n<<<<<<< example\nbody\n"
+    let ours = "intro CHANGED\n<<<<<<< example\nbody\n"
+    let theirs = "intro OTHER\n<<<<<<< example\nbody\n"
+
+    test.case("the inputs are detected as marker-carrying BEFORE the merge runs")
+    test.assert(diffmerge.has_marker_lines(base, 7))
+
+    test.case("and are not, at a marker size the file does not use")
+    test.assert(not diffmerge.has_marker_lines(base, 9))
+
+    test.case("a merge at size 9 writes markers the file cannot be confused with")
+    let o = DiffMergeOptions { unit: DiffLines,
+                               policy: diffunit.exact_policy(),
+                               style: DiffMergeTwoSided,
+                               favor: DiffFavorNone,
+                               marker_size: 9,
+                               labels: DiffMergeLabels { base: "b", ours: "o", theirs: "t" },
+                               diff: diffscript.minimal_options() }
+    let r = diffmerge.merge3(base, ours, theirs, o)
+    test.assert(str.index(r.text, "<<<<<<<<<") != None)
+
+@test
+fn test_favouring_a_side_resolves_the_region_and_still_records_it() [io]
+    let base = "one\ntwo\nthree\n"
+    let ours = "one\nOURS\nthree\n"
+    let theirs = "one\nTHEIRS\nthree\n"
+
+    test.case("favouring ours writes ours and no markers")
+    let o = DiffMergeOptions { unit: DiffLines,
+                               policy: diffunit.exact_policy(),
+                               style: DiffMergeTwoSided,
+                               favor: DiffFavorOurs,
+                               marker_size: 7,
+                               labels: DiffMergeLabels { base: "b", ours: "o", theirs: "t" },
+                               diff: diffscript.minimal_options() }
+    let r = diffmerge.merge3(base, ours, theirs, o)
+    test.assert(r.text == "one\nOURS\nthree\n")
+    test.assert(str.index(r.text, "<<<<<<<") == None)
+
+    test.case("the merge counts as clean")
+    test.assert(diffmerge.clean(r))
+
+    test.case("AND the region is still on the conflict list, marked resolved")
+    test.assert(list.len(r.conflicts) == 1)
+    test.assert(r.conflicts[0].resolved)
+
+@test
+fn test_no_base_makes_every_difference_a_conflict() [io]
+    test.case("an empty base is the honest answer to two files with no ancestor")
+    let r = diffmerge.merge3("", "a\n", "b\n", diffmerge.merge_options())
+    test.assert(not diffmerge.clean(r))
+    test.assert(list.len(r.conflicts) == 1)
+
+    test.case("and the base range of that conflict is empty")
+    test.assert(diffunit.range_empty(r.conflicts[0].base))
+
+@test
+fn test_word_granularity_narrows_a_prose_conflict() [io]
+    let base = "the quick brown fox\n"
+    let ours = "the quick brown cat\n"
+    let theirs = "a quick brown fox\n"
+
+    test.case("at line granularity the whole line conflicts")
+    let lines = diffmerge.merge3(base, ours, theirs, diffmerge.merge_options())
+    test.assert(not diffmerge.clean(lines))
+
+    test.case("at word granularity the two edits are in different places and merge")
+    let o = DiffMergeOptions { unit: DiffWords,
+                               policy: diffunit.exact_policy(),
+                               style: DiffMergeTwoSided,
+                               favor: DiffFavorNone,
+                               marker_size: 7,
+                               labels: DiffMergeLabels { base: "b", ours: "o", theirs: "t" },
+                               diff: diffscript.minimal_options() }
+    let words = diffmerge.merge3(base, ours, theirs, o)
+    test.assert(diffmerge.clean(words))
+    test.assert(words.text == "a quick brown cat\n")
+
+@test
+fn test_the_buffer_form_and_the_single_conflict_renderer() [io]
+    let base = "one\ntwo\nthree\n"
+    let ours = "one\nOURS\nthree\n"
+    let theirs = "one\nTHEIRS\nthree\n"
+    let o = diffmerge.merge_options()
+
+    test.case("merge3_into appends to the caller's buffer and hands the conflicts back beside it")
+    let seed: [u8] = [35]
+    let out = diffmerge.merge3_into(seed, base, ours, theirs, o)
+    test.assert(out.0[0] == 35)
+    test.assert(list.len(out.1) == 1)
+
+    test.case("conflict_into renders ONE conflict, for a caller writing its own resolution")
+    let toks = diffmerge.merge_tokens(base, ours, theirs, o)
+    let empty: [u8] = []
+    let one = diffmerge.conflict_into(empty, out.1[0], toks.0, toks.1, toks.2, o)
+    let text = bytes.byte_list_to_str(one)
+    test.assert(str.index(text, "OURS") != None)
+    test.assert(str.index(text, "THEIRS") != None)

@@ -1,0 +1,279 @@
+// diffpatch.nv — a unified diff read back in, and applied.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// **`apply` DOES NOT ANSWER A `Result`, AND THAT IS THE DESIGN.**  A
+// patch of five hunks that places three and rejects two has produced a
+// file and a reject list. That is what `patch(1)` does, it is what
+// every person who has ever run `patch` expects, and it is the only
+// answer a caller can act on: an `Err` throws away the three hunks that
+// went in, and the caller then has to re-implement partial application
+// to get them back. So `DiffApplyResult` carries the text, what
+// happened to every hunk that applied, and the ones that did not —
+// and `rejects_empty` is the one-line check for a caller who wanted
+// all-or-nothing after all.
+//
+// PARSING IS A `Result`, and the asymmetry is the point: a malformed
+// patch is a bug in the bytes, and there is nothing to hand back.
+//
+// FUZZ IS TWO NUMBERS, NOT ONE.  `patch` has an offset — how far from
+// the line the header names it is willing to look — and a fuzz — how
+// many context lines it is willing to drop. They fail differently: an
+// offset means the file moved, which is ordinary; dropping context
+// means the surrounding code changed, which is where a wrong
+// application comes from. A single knob makes the dangerous one
+// invisible, so both are fields and `DiffApplyResult` reports both
+// per hunk.
+//
+// THE SPANS POINT INTO THE PATCH, NOT INTO A COPY OF IT.  A parsed
+// patch holds the patch text and byte spans into it. A `git format-patch`
+// series of a thousand hunks is parsed without copying a line, and a
+// caller that only wants the file names never touches the bodies.
+
+use diffunit
+use diffscript
+
+// What a line in a hunk body is.
+pub enum DiffPatchLineKind
+    // A ` ` line: present on both sides.
+    DiffPatchContext
+    // A `-` line.
+    DiffPatchRemoved
+    // A `+` line.
+    DiffPatchAdded
+    // A `\ No newline at end of file` line. It qualifies the line
+    // BEFORE it, and it is a kind of its own rather than a flag on
+    // that line because a hunk can carry two of them — one for the
+    // removed side and one for the added side — and a flag cannot
+    // hold both.
+    DiffPatchNoNewline
+
+// One line of a hunk body.
+pub struct DiffPatchLine
+    kind: DiffPatchLineKind
+    // The line's text WITHOUT its leading marker byte, as a span into
+    // the patch text.
+    text: diffunit.DiffSpan
+
+// One `@@` hunk.
+pub struct DiffPatchHunk
+    // 1-based start line in the left file, and how many lines of it
+    // this hunk covers. Zero and zero for a hunk that only adds.
+    a_start: Int
+    a_count: Int
+    // The same for the right file.
+    b_start: Int
+    b_count: Int
+    // The section heading after the second `@@`, as a span into the
+    // patch text; an empty span when there is none.
+    section: diffunit.DiffSpan
+    lines: [DiffPatchLine]
+
+// One file's worth of a patch: the `---`/`+++` pair and its hunks.
+pub struct DiffFilePatch
+    // The two names as the patch spells them, prefixes and all. NOT
+    // stripped of `a/` and `b/`: how many leading components to strip
+    // is `patch -p<n>`, it is the caller's choice, and a package that
+    // guessed would be wrong for every patch that was not made by git.
+    a_path: Str
+    b_path: Str
+    // The timestamps as written, or empty strings.
+    a_stamp: Str
+    b_stamp: Str
+    hunks: [DiffPatchHunk]
+
+// A whole patch file, which may cover many files.
+pub struct DiffPatch
+    // The patch text, held so the spans mean something.
+    source: Str
+    files: [DiffFilePatch]
+
+// Why a patch could not be parsed. Every variant carries the 1-based
+// line of the patch it failed on, because a patch is a file somebody
+// will open in an editor.
+pub enum DiffPatchError
+    // A `---` without a `+++` after it, or a `+++` with no `---`.
+    DiffPatchBadFileHeader(line: Int)
+    // An `@@` line that is not `@@ -l[,s] +l[,s] @@`.
+    DiffPatchBadHunkHeader(line: Int)
+    // The hunk's body does not contain the number of lines its header
+    // declared. Carries both numbers, because the difference says which
+    // side is wrong.
+    DiffPatchHunkCountMismatch(line: Int, declared: Int, counted: Int)
+    // A line inside a hunk whose first byte is none of ` `, `-`, `+`,
+    // `\`.
+    DiffPatchBadLinePrefix(line: Int)
+    // The patch ends inside a hunk.
+    DiffPatchTruncated(line: Int)
+    // Nothing in the text looked like a patch at all.
+    DiffPatchNotAPatch
+
+// The one-line message, for a caller printing rather than matching.
+//
+// `Result<T, DiffPatchError>` requires it — SPEC § 3.4 makes `Error`
+// the bound on a result's error type — so the impl exists whether or
+// not an interface release has anything to say yet, and its body is a
+// `todo()` like every other body here. The message every variant will
+// carry names the patch line, because a malformed patch is a file
+// somebody is about to open in an editor.
+//
+// ```novo
+// use diffpatch
+//
+// match diffpatch.parse_unified("not a patch at all\n")
+//     Ok(_)  => println("parsed")
+//     Err(e) => println(e.message())
+// ```
+impl Error for DiffPatchError
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("diff-nv.DiffPatchError.message")
+
+// How far an applier may bend.
+pub struct DiffApplyOptions
+    // Context lines a hunk may lose before it is rejected. `patch -F`.
+    // Zero means every context line must match.
+    fuzz: Int
+    // Lines away from the header's position the applier may search.
+    // Zero means the hunk must be exactly where it says it is.
+    max_offset: Int
+    // Apply the patch backwards: `patch -R`.
+    reverse: Bool
+    // Compare context and removed lines ignoring horizontal
+    // whitespace. `git apply --ignore-whitespace`.
+    ignore_whitespace: Bool
+    // Answer `DiffRejectAlreadyApplied` for a hunk whose ADDED lines
+    // are already present where its removed lines should have been,
+    // instead of `DiffRejectNoMatch`. Off by default because deciding
+    // this costs a second search, and on for an installer that has to
+    // be re-runnable.
+    detect_already_applied: Bool
+
+// Why one hunk did not go in.
+pub enum DiffRejectReason
+    // Its context does not occur within `max_offset`, even after
+    // dropping `fuzz` lines.
+    DiffRejectNoMatch
+    // Its context occurs at more than one place within `max_offset`
+    // and the applier will not guess. Carries both positions, because
+    // a person resolving this needs to see them.
+    DiffRejectAmbiguous(at: Int, also_at: Int)
+    // The hunk's effect is already in the file.
+    DiffRejectAlreadyApplied(at: Int)
+    // It would touch lines an earlier hunk already changed. Carries the
+    // index of that hunk.
+    DiffRejectOverlap(with_hunk: Int)
+
+// One rejected hunk.
+pub struct DiffReject
+    // Index into the file patch's `hunks`.
+    hunk: Int
+    reason: DiffRejectReason
+
+// What one hunk that DID go in cost.
+pub struct DiffPlacement
+    hunk: Int
+    // Lines from where its header said it would be. Negative is
+    // earlier.
+    offset: Int
+    // Context lines dropped to make it fit. Zero is a clean
+    // application; anything else is the number a person should look
+    // at.
+    fuzz_used: Int
+
+// The result of applying a file patch.
+pub struct DiffApplyResult
+    // The file as it stands after every hunk that applied. The
+    // original text when every hunk was rejected.
+    text: Str
+    placed: [DiffPlacement]
+    rejects: [DiffReject]
+
+// `patch`'s defaults: no fuzz, an offset search of 20 lines, forwards.
+pub fn apply_options() -> DiffApplyOptions []
+    todo("diff-nv.diffpatch.apply_options")
+
+// `git apply`'s defaults: no fuzz and no offset — a hunk is exactly
+// where it says it is or it is rejected.
+pub fn strict_apply_options() -> DiffApplyOptions []
+    todo("diff-nv.diffpatch.strict_apply_options")
+
+// Parse unified-diff text.
+//
+// ```novo
+// use diffpatch
+//
+// let text = "--- a\n+++ b\n@@ -1 +1 @@\n-one\n+two\n"
+// match diffpatch.parse_unified(text)
+//     Ok(p)  => println(str.from_int(list.len(p.files)))
+//     Err(_) => println("not a patch")
+// ```
+pub fn parse_unified(text: Str) -> Result<DiffPatch, DiffPatchError> []
+    todo("diff-nv.diffpatch.parse_unified")
+
+// The 1-based patch line a parse error was found on, for a caller
+// reporting it without matching on every variant.
+pub fn error_line(e: DiffPatchError) -> Int []
+    todo("diff-nv.diffpatch.error_line")
+
+// Apply one file's hunks to that file's text.
+//
+// ```novo
+// use diffpatch
+//
+// let text = "--- a\n+++ b\n@@ -1 +1 @@\n-one\n+two\n"
+// match diffpatch.parse_unified(text)
+//     Err(_) => println("not a patch")
+//     Ok(p)  =>
+//         let r = diffpatch.apply("one\n", p.files[0], diffpatch.apply_options())
+//         println(if diffpatch.rejects_empty(r) then "clean" else "rejected")
+// ```
+pub fn apply(text: Str, fp: DiffFilePatch, o: DiffApplyOptions) -> DiffApplyResult []
+    todo("diff-nv.diffpatch.apply")
+
+// Apply, appending the result to the caller's buffer instead of
+// allocating a string. The rejects come back beside it because they
+// are not bytes.
+pub fn apply_into(out: [u8], text: Str, fp: DiffFilePatch,
+                  o: DiffApplyOptions) -> ([u8], [DiffReject]) []
+    todo("diff-nv.diffpatch.apply_into")
+
+// Whether every hunk applied — the check a caller who wanted
+// all-or-nothing makes, before deciding to keep the text or throw it
+// away.
+pub fn rejects_empty(r: DiffApplyResult) -> Bool []
+    todo("diff-nv.diffpatch.rejects_empty")
+
+// Append a `.rej` file's contents to `out`: the rejected hunks, in
+// unified form, exactly as `patch` writes them, so the file a person
+// finds beside their source is the file they expect.
+pub fn reject_file_into(out: [u8], p: DiffPatch, fp: DiffFilePatch, rs: [DiffReject]) -> [u8] []
+    todo("diff-nv.diffpatch.reject_file_into")
+
+// A parsed file patch as an edit script, so everything in
+// `diffscript` and `diffrender` works on a patch that came off disk —
+// counting it, inverting it, rendering it side by side.
+//
+// The ranges are token ranges over the patch's own line numbering,
+// which is what makes this exact: a patch names line numbers and this
+// package's ranges are line indices, so the conversion is a
+// subtraction rather than a re-diff.
+pub fn script_of(fp: DiffFilePatch) -> diffscript.DiffScript []
+    todo("diff-nv.diffpatch.script_of")
+
+// Render an edit script back out as a file patch value, so a caller can
+// write a patch it computed with `reject_file_into`, or round-trip one.
+pub fn patch_of(input: diffunit.DiffInput, s: diffscript.DiffScript, a_path: Str, b_path: Str,
+                context: Int) -> DiffFilePatch []
+    todo("diff-nv.diffpatch.patch_of")
+
+// Strip `n` leading path components from a name, as `patch -p<n>`
+// does — including its rule that `/dev/null` is never stripped and
+// means the file is created or deleted.
+pub fn strip_path(name: Str, n: Int) -> Str []
+    todo("diff-nv.diffpatch.strip_path")
+
+// Whether a file patch creates the file (`--- /dev/null`) or deletes
+// it (`+++ /dev/null`), as `(creates, deletes)`.
+pub fn file_mode(fp: DiffFilePatch) -> (Bool, Bool) []
+    todo("diff-nv.diffpatch.file_mode")

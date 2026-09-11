@@ -1,0 +1,221 @@
+// diffpatch_tests.nv — a unified diff read back in, and applied.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE `patch`'s OWN.  GNU patch's testsuite is where the
+// fuzz and offset cases come from, and `git apply`'s `t4xxx` tests are
+// where the strict ones do. The two disagree on purpose — `git apply`
+// refuses what `patch` would place with fuzz — and this package
+// carries both as named option sets rather than picking one.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: a patch that applies three
+// hunks and rejects two answers a FILE and a reject list, not an
+// error. Every case below that touches `apply` is checking that the
+// partial result survived.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use diffpatch
+use diffunit
+use diffscript
+
+fn one_file_patch() -> Str
+    "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+
+fn parsed() -> diffpatch.DiffFilePatch
+    match diffpatch.parse_unified(one_file_patch())
+        Ok(p)  => p.files[0]
+        Err(_) => DiffFilePatch { a_path: "", b_path: "", a_stamp: "", b_stamp: "", hunks: [] }
+
+@test
+fn test_a_patch_parses_to_spans_into_its_own_text() [io]
+    match diffpatch.parse_unified(one_file_patch())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("one file, one hunk")
+            test.assert(list.len(p.files) == 1)
+            test.assert(list.len(p.files[0].hunks) == 1)
+
+            test.case("the paths are as the patch spells them — a/ and b/ are NOT stripped")
+            test.assert(p.files[0].a_path == "a/f.txt")
+            test.assert(p.files[0].b_path == "b/f.txt")
+
+            test.case("stripping is the caller's choice, and -p1 is what git needs")
+            test.assert(diffpatch.strip_path(p.files[0].a_path, 1) == "f.txt")
+
+            test.case("the header's line numbers came through")
+            let h = p.files[0].hunks[0]
+            test.assert(h.a_start == 1)
+            test.assert(h.a_count == 3)
+            test.assert(h.b_start == 1)
+            test.assert(h.b_count == 3)
+
+            test.case("four body lines: two context, one removed, one added")
+            test.assert(list.len(h.lines) == 4)
+
+@test
+fn test_every_malformed_patch_names_the_line_it_failed_on() [io]
+    test.case("a hunk header that is not @@ -l,s +l,s @@")
+    match diffpatch.parse_unified("--- a\n+++ b\n@@ nonsense @@\n one\n")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                DiffPatchBadHunkHeader(line) => test.assert(line == 3)
+                _                            => test.assert(false)
+
+    test.case("a body shorter than the header declared, with both counts reported")
+    match diffpatch.parse_unified("--- a\n+++ b\n@@ -1,3 +1,3 @@\n one\n")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                DiffPatchHunkCountMismatch(_, declared, counted) =>
+                    test.assert(declared == 3)
+                    test.assert(counted == 1)
+                _                                                => test.assert(false)
+
+    test.case("text that is not a patch at all")
+    match diffpatch.parse_unified("just some prose\n")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                DiffPatchNotAPatch => test.assert(true)
+                _                  => test.assert(false)
+
+    test.case("and error_line reads the line off any of them without a match")
+    test.assert(diffpatch.error_line(DiffPatchBadHunkHeader(7)) == 7)
+
+@test
+fn test_a_clean_application_places_every_hunk_at_no_offset_and_no_fuzz() [io]
+    let r = diffpatch.apply("one\ntwo\nthree\n", parsed(), diffpatch.apply_options())
+
+    test.case("the text is the patched file")
+    test.assert(r.text == "one\nTWO\nthree\n")
+
+    test.case("nothing was rejected")
+    test.assert(diffpatch.rejects_empty(r))
+
+    test.case("and the placement says it cost nothing — offset 0, fuzz 0")
+    test.assert(list.len(r.placed) == 1)
+    test.assert(r.placed[0].offset == 0)
+    test.assert(r.placed[0].fuzz_used == 0)
+
+@test
+fn test_offset_and_fuzz_are_two_knobs_and_they_fail_differently() [io]
+    // The file moved down two lines; the context is intact.
+    let moved = "zero\nhalf\none\ntwo\nthree\n"
+
+    test.case("git apply's strict options refuse a hunk that is not where it says it is")
+    let strict = diffpatch.apply(moved, parsed(), diffpatch.strict_apply_options())
+    test.assert(not diffpatch.rejects_empty(strict))
+
+    test.case("patch's options place it, and report HOW FAR it moved")
+    let loose = diffpatch.apply(moved, parsed(), diffpatch.apply_options())
+    test.assert(diffpatch.rejects_empty(loose))
+    test.assert(loose.placed[0].offset == 2)
+    test.assert(loose.placed[0].fuzz_used == 0)
+
+    test.case("a changed context line is rejected at fuzz 0 — that is not an offset")
+    let changed = "one\ntwo\nTHREE-CHANGED\n"
+    let nofuzz = diffpatch.apply(changed, parsed(), diffpatch.apply_options())
+    test.assert(not diffpatch.rejects_empty(nofuzz))
+
+    test.case("and placed at fuzz 1, with fuzz_used saying a context line was dropped")
+    let o = DiffApplyOptions { fuzz: 1, max_offset: 20, reverse: false,
+                               ignore_whitespace: false, detect_already_applied: false }
+    let fuzzed = diffpatch.apply(changed, parsed(), o)
+    test.assert(diffpatch.rejects_empty(fuzzed))
+    test.assert(fuzzed.placed[0].fuzz_used == 1)
+
+@test
+fn test_a_partial_application_answers_a_file_and_a_reject_list() [io]
+    // Two hunks; the second one's context is gone.
+    let two = "--- a\n+++ b\n@@ -1 +1 @@\n-one\n+ONE\n@@ -5 +5 @@\n-five\n+FIVE\n"
+    match diffpatch.parse_unified(two)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let r = diffpatch.apply("one\ntwo\nthree\n", p.files[0],
+                                    diffpatch.strict_apply_options())
+
+            test.case("THE FIRST HUNK STILL WENT IN — this is the whole design")
+            test.assert(str.index(r.text, "ONE") != None)
+
+            test.case("and the second is on the reject list rather than an Err")
+            test.assert(list.len(r.rejects) == 1)
+            test.assert(r.rejects[0].hunk == 1)
+            match r.rejects[0].reason
+                DiffRejectNoMatch => test.assert(true)
+                _                 => test.assert(false)
+
+            test.case("rejects_empty is the check a caller who wanted all-or-nothing makes")
+            test.assert(not diffpatch.rejects_empty(r))
+
+            test.case("and the .rej file holds exactly the hunk that did not apply")
+            let empty: [u8] = []
+            let rej = diffpatch.reject_file_into(empty, p, p.files[0], r.rejects)
+            let text = bytes.byte_list_to_str(rej)
+            test.assert(str.index(text, "five") != None)
+            test.assert(str.index(text, "one") == None)
+
+@test
+fn test_a_patch_is_an_edit_script_and_an_edit_script_is_a_patch() [io]
+    test.case("a parsed patch converts to a script without re-diffing anything")
+    let s = diffpatch.script_of(parsed())
+    test.assert(list.len(s.ops) > 0)
+
+    test.case("reverse applies the script backwards — patch -R")
+    let o = DiffApplyOptions { fuzz: 0, max_offset: 20, reverse: true,
+                               ignore_whitespace: false, detect_already_applied: false }
+    let back = diffpatch.apply("one\nTWO\nthree\n", parsed(), o)
+    test.assert(back.text == "one\ntwo\nthree\n")
+
+    test.case("/dev/null on the left means the patch creates the file")
+    match diffpatch.parse_unified("--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n")
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let m = diffpatch.file_mode(p.files[0])
+            test.assert(m.0)
+            test.assert(not m.1)
+
+    test.case("and strip_path never strips /dev/null")
+    test.assert(diffpatch.strip_path("/dev/null", 1) == "/dev/null")
+
+@test
+fn test_already_applied_is_its_own_answer_when_the_caller_asks_for_it() [io]
+    test.case("off by default, a re-run looks like a plain no-match")
+    let again = diffpatch.apply("one\nTWO\nthree\n", parsed(),
+                                diffpatch.strict_apply_options())
+    test.assert(not diffpatch.rejects_empty(again))
+    match again.rejects[0].reason
+        DiffRejectNoMatch => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("on, the same run says the effect is already there and where")
+    let o = DiffApplyOptions { fuzz: 0, max_offset: 20, reverse: false,
+                               ignore_whitespace: false, detect_already_applied: true }
+    let detected = diffpatch.apply("one\nTWO\nthree\n", parsed(), o)
+    match detected.rejects[0].reason
+        DiffRejectAlreadyApplied(at) => test.assert(at == 1)
+        _                            => test.assert(false)
+
+@test
+fn test_a_script_round_trips_through_a_patch_value() [io]
+    test.case("patch_of turns an edit script into the file patch that would write it")
+    let input = diffunit.tokenize("one\ntwo\nthree\n", "one\nTWO\nthree\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let fp = diffpatch.patch_of(input, s, "a/f.txt", "b/f.txt", 3)
+    test.assert(fp.a_path == "a/f.txt")
+    test.assert(list.len(fp.hunks) == 1)
+
+    test.case("and applying that patch to the left input produces the right one")
+    let r = diffpatch.apply("one\ntwo\nthree\n", fp, diffpatch.strict_apply_options())
+    test.assert(r.text == "one\nTWO\nthree\n")
+
+    test.case("apply_into appends to the caller's buffer instead of allocating a string")
+    let seed: [u8] = [62]
+    let out = diffpatch.apply_into(seed, "one\ntwo\nthree\n", fp,
+                                   diffpatch.strict_apply_options())
+    test.assert(out.0[0] == 62)
+    test.assert(list.len(out.1) == 0)

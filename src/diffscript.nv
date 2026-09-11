@@ -1,0 +1,252 @@
+// diffscript.nv — the edit script, and the three ways of finding one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// **THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `DiffOp`**, and the
+// load-bearing fact about it is that its four variants carry token
+// RANGES and no text at all.
+//
+//   DiffEqual(a, b)     the same tokens, at both positions
+//   DiffDelete(a)       tokens in a that are not in b
+//   DiffInsert(b)       tokens in b that are not in a
+//   DiffReplace(a, b)   a run of each, paired
+//
+// Everything else in this package is a reader of that list. Unified
+// rendering walks it; side-by-side rendering walks it; a patch parsed
+// off disk is turned into one; a three-way merge is two of them
+// compared. A consumer that wants none of those — snapshot-nv deciding
+// whether a snapshot changed, `novo fmt --check` deciding whether a
+// file is formatted, an editor painting a gutter — reads the list and
+// never renders anything.
+//
+// WHY `DiffReplace` EXISTS AT ALL.  A minimal edit script needs only
+// delete and insert; a replace is a delete adjacent to an insert.  It
+// is here because every consumer re-derives it and the derivations
+// disagree: a renderer pairs them to show `-`/`+` side by side, a
+// merger pairs them to decide whether two edits overlap, and a
+// refinement pairs them to run a word diff inside them.  Pairing them
+// once, in the algorithm that already knows where the runs are, is the
+// difference between one rule and four.  `similar`'s `DiffOp` made the
+// same call, and `difflib`'s opcodes did before it.
+//
+// WHY A SCRIPT IS NOT JUST `[DiffOp]`.  `DiffScript` carries which
+// algorithm produced it and whether the answer is MINIMAL.  Myers'
+// O(ND) is quadratic in the worst case, so every real implementation
+// bounds the search and falls back to a coarse script when the bound
+// is hit — `similar` calls it a deadline, git calls it
+// `--no-minimal`. A caller that is showing a person a diff does not
+// care; a caller that is asserting two files are identical, or
+// applying the script as a patch, very much does, and an API that
+// hides the degradation makes that caller unable to ask.
+
+use diffunit
+
+// Which walk to take. All three answer a correct edit script; they
+// differ in which correct script they answer.
+pub enum DiffAlgo
+    // Myers' O(ND) greedy walk (Myers 1986). The shortest edit script,
+    // subject to the step bound. The default, and what `diff` does.
+    DiffMyers
+    // Bram Cohen's patience diff: match the tokens that occur exactly
+    // once on each side, in order, and recurse between them. Slower,
+    // and much better on source code that moved — a block of braces
+    // matched by Myers because braces are identical is matched here by
+    // the unique line above it.
+    DiffPatience
+    // JGit's histogram diff: patience, with the rarest common token
+    // used as the split point when no token is unique. What git uses
+    // when asked, and the best default for code.
+    DiffHistogram
+
+// How the walk is bounded and which walk it is.
+pub struct DiffOptions
+    algo: DiffAlgo
+    // The most edit-graph steps the search may take before it gives up
+    // on minimality and answers a coarse script. Zero means unbounded,
+    // which is the right setting for a test and the wrong one for an
+    // editor. Counted in steps rather than in milliseconds because a
+    // `core` package has no clock, and because a step bound is
+    // reproducible and a time bound is not — the same two files must
+    // produce the same diff on every machine, or a snapshot test is a
+    // coin toss.
+    max_steps: Int
+    // Histogram only: a token occurring more often than this on either
+    // side is not considered as a split point. JGit's default is 64.
+    max_chain: Int
+
+// One edit operation over token ranges. See the module comment: this
+// is the package's load-bearing interface.
+pub enum DiffOp
+    // The tokens `a` and `b` are equal. Both ranges have the same
+    // length; both are carried because the two sides are at different
+    // offsets and every consumer needs both.
+    DiffEqual(a: diffunit.DiffRange, b: diffunit.DiffRange)
+    // The tokens in `a` are in the left input and not the right.
+    DiffDelete(a: diffunit.DiffRange)
+    // The tokens in `b` are in the right input and not the left.
+    DiffInsert(b: diffunit.DiffRange)
+    // A deletion and an insertion at the same place. The two ranges
+    // need not be the same length.
+    DiffReplace(a: diffunit.DiffRange, b: diffunit.DiffRange)
+
+// An edit script, and what is true about it.
+pub struct DiffScript
+    // The operations, in order, covering both inputs completely: the
+    // `a` ranges tile the left input and the `b` ranges tile the right,
+    // with no gap and no overlap. A consumer may rely on that.
+    ops: [DiffOp]
+    algo: DiffAlgo
+    // False when `max_steps` cut the search short and the script is
+    // correct but not minimal. See the module comment.
+    minimal: Bool
+    // Edit-graph steps actually taken, so a caller tuning `max_steps`
+    // has a number to tune against.
+    steps: Int
+
+// A run of changes with `context` unchanged tokens on each side of it,
+// and the tokens that separate it from the next run.
+//
+// This is what a `@@` header names, and a hunk is a value here rather
+// than a formatting concern because a patch applier needs one too, and
+// because an editor showing "3 changed regions" is counting these.
+pub struct DiffHunk
+    // The token range this hunk covers in the left input, context
+    // included.
+    a: diffunit.DiffRange
+    // The token range in the right input, context included.
+    b: diffunit.DiffRange
+    // The operations inside it, clipped to the ranges above.
+    ops: [DiffOp]
+
+// Myers, bounded at a million steps. What `diff` does, and the right
+// default for a person reading the output.
+//
+// ```novo
+// use diffscript
+//
+// let o = diffscript.default_options()
+// println(str.from_int(o.max_steps))
+// ```
+pub fn default_options() -> DiffOptions []
+    todo("diff-nv.diffscript.default_options")
+
+// Unbounded Myers: always minimal, however long it takes. What a test
+// wants, and what `novo fmt --check` wants, because a formatter's diff
+// is small by construction.
+pub fn minimal_options() -> DiffOptions []
+    todo("diff-nv.diffscript.minimal_options")
+
+// Patience, bounded as `default_options`.
+pub fn patience_options() -> DiffOptions []
+    todo("diff-nv.diffscript.patience_options")
+
+// Histogram with JGit's chain limit of 64. The best default for source
+// code, and what `git diff --histogram` does.
+pub fn histogram_options() -> DiffOptions []
+    todo("diff-nv.diffscript.histogram_options")
+
+// Diff a tokenised pair.
+//
+// ```novo
+// use diffunit
+// use diffscript
+//
+// let input = diffunit.tokenize("a\nb\nc\n", "a\nx\nc\n", DiffLines)
+// let s = diffscript.diff(input, diffscript.default_options())
+// println(if s.minimal then "minimal" else "bounded out")
+// ```
+pub fn diff(input: diffunit.DiffInput, o: DiffOptions) -> DiffScript []
+    todo("diff-nv.diffscript.diff")
+
+// Diff two lists of token ids. THE INTEGER ENTRY POINT, and it is
+// public on purpose: a caller with tokens of its own — a snapshot
+// library over records, a test harness over syntax trees — interns its
+// own values and never touches `diffunit` at all.
+//
+// ```novo
+// use diffscript
+//
+// let s = diffscript.diff_ids([1, 2, 3], [1, 9, 3], diffscript.default_options())
+// println(str.from_int(list.len(s.ops)))
+// ```
+pub fn diff_ids(a: [Int], b: [Int], o: DiffOptions) -> DiffScript []
+    todo("diff-nv.diffscript.diff_ids")
+
+// The script grouped into hunks with `context` tokens of surrounding
+// equality, the way `diff -U<context>` groups them: two runs of change
+// closer than `2 * context` apart share a hunk.
+pub fn hunks(s: DiffScript, context: Int) -> [DiffHunk] []
+    todo("diff-nv.diffscript.hunks")
+
+// How many tokens the script deletes and how many it inserts, as
+// `(deleted, inserted)` — the two numbers a `--stat` line carries.
+pub fn counts(s: DiffScript) -> (Int, Int) []
+    todo("diff-nv.diffscript.counts")
+
+// `difflib.SequenceMatcher.ratio`: twice the matched token count over
+// the total token count, in `[0.0, 1.0]`.
+//
+// Python's own definition, including that it is NOT a metric — the
+// ratio of `a` to `b` may differ from the ratio of `b` to `a` under a
+// non-minimal script, and the README says so rather than pretending
+// otherwise.
+pub fn ratio(s: DiffScript, a_len: Int, b_len: Int) -> Float []
+    todo("diff-nv.diffscript.ratio")
+
+// Whether the script says the two inputs are identical: one
+// `DiffEqual` and nothing else, or nothing at all.
+//
+// The call `novo fmt --check` and snapshot-nv actually make, and the
+// reason it is a named function is that the obvious test — an empty
+// op list — is wrong: two identical files produce one `DiffEqual`.
+pub fn unchanged(s: DiffScript) -> Bool []
+    todo("diff-nv.diffscript.unchanged")
+
+// The left range of any operation; an empty range for `DiffInsert`.
+pub fn op_a(op: DiffOp) -> diffunit.DiffRange []
+    todo("diff-nv.diffscript.op_a")
+
+// The right range of any operation; an empty range for `DiffDelete`.
+pub fn op_b(op: DiffOp) -> diffunit.DiffRange []
+    todo("diff-nv.diffscript.op_b")
+
+// Whether an operation is anything but `DiffEqual`.
+pub fn op_changed(op: DiffOp) -> Bool []
+    todo("diff-nv.diffscript.op_changed")
+
+// The script that turns the right input back into the left: every
+// delete becomes an insert, every insert a delete, and the two ranges
+// of every equal and replace swap.
+//
+// What `patch -R` needs, and what a caller undoing an applied patch
+// needs.
+pub fn invert(s: DiffScript) -> DiffScript []
+    todo("diff-nv.diffscript.invert")
+
+// Re-diff one `DiffReplace` at a finer granularity, so a changed line
+// can be shown with the changed WORDS marked.
+//
+// Answers a script over the tokens of that operation's byte spans, in
+// the finer unit's own indices — which is why it takes the input it
+// came from: the finer tokenisation is of the two spans, not of the
+// two files.
+//
+// This is `similar`'s `iter_inline_changes`, and it is the call that
+// makes a prose diff readable. It is a separate function rather than
+// an option on `diff` because it is quadratic in the size of one
+// changed run and a caller showing ten thousand changed lines must be
+// able to decline it for the ones that are off screen.
+pub fn refine(input: diffunit.DiffInput, op: DiffOp, finer: diffunit.DiffUnit,
+              o: DiffOptions) -> DiffScript []
+    todo("diff-nv.diffscript.refine")
+
+// The longest common subsequence of two id lists, as the pairs of
+// indices that match.
+//
+// Published because it is what a caller building something other than
+// a diff out of the same walk needs — a three-way merge's base
+// alignment, a duplicate-block detector — and because it is the piece
+// the algorithms actually compute; `diff_ids` is this plus the pairing
+// of the gaps.
+pub fn common_subsequence(a: [Int], b: [Int], o: DiffOptions) -> [(Int, Int)] []
+    todo("diff-nv.diffscript.common_subsequence")

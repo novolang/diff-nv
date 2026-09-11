@@ -1,0 +1,142 @@
+// diffunit_tests.nv — the tokenisers, and the bridge between the two
+// kinds of interval.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: a token's SPAN is where it sits
+// in the caller's own string, and `range_span` is the only way a token
+// index becomes a byte offset. Every unit test below is a check that
+// the two never got mixed up.
+
+use std.test
+use std.list
+use diffunit
+
+@test
+fn test_a_token_knows_where_it_sits_in_the_callers_string() [io]
+    let input = diffunit.tokenize("one\ntwo\nthree\n", "one\n", DiffLines)
+
+    test.case("three line tokens on the left")
+    test.assert(diffunit.token_count(input.a) == 3)
+
+    test.case("the second token's span is bytes 4 to 8 — the terminator belongs to it")
+    let s = diffunit.token_span(input.a, 1)
+    test.assert(s.start == 4)
+    test.assert(s.end == 8)
+
+    test.case("and reading it back gives the line with its newline")
+    test.assert(diffunit.token_str(input.a, 1) == "two\n")
+    test.assert(diffunit.span_str(input.a, s) == "two\n")
+
+    test.case("an index past the end answers a zero span rather than stopping the program")
+    let past = diffunit.token_span(input.a, 99)
+    test.assert(past.start == past.end)
+
+@test
+fn test_range_span_is_the_only_bridge_between_the_two_intervals() [io]
+    let input = diffunit.tokenize("one\ntwo\nthree\n", "one\n", DiffLines)
+
+    test.case("a two-token range spans from the first token's start to the last one's end")
+    let s = diffunit.range_span(input.a, DiffRange { start: 0, end: 2 })
+    test.assert(s.start == 0)
+    test.assert(s.end == 8)
+
+    test.case("an empty range is an insertion POINT, positioned where the range begins")
+    let e = diffunit.range_span(input.a, DiffRange { start: 2, end: 2 })
+    test.assert(e.start == e.end)
+    test.assert(e.start == 8)
+
+    test.case("range_len and range_empty read the token count, not the byte count")
+    test.assert(diffunit.range_len(DiffRange { start: 0, end: 2 }) == 2)
+    test.assert(diffunit.range_empty(DiffRange { start: 2, end: 2 }))
+
+    test.case("line_of_byte goes the other way, and counts from 1")
+    test.assert(diffunit.line_of_byte(input.a, 0) == 1)
+    test.assert(diffunit.line_of_byte(input.a, 5) == 2)
+
+@test
+fn test_the_last_line_without_a_newline_is_representable() [io]
+    let input = diffunit.tokenize("a\nb", "a\nb\n", DiffLines)
+
+    test.case("the left side's last token is unterminated")
+    test.assert(diffunit.token_unterminated(input.a, 1))
+
+    test.case("the right side's is not — this is the difference the marker reports")
+    test.assert(not diffunit.token_unterminated(input.b, 1))
+
+    test.case("and a token in the middle never is")
+    test.assert(not diffunit.token_unterminated(input.a, 0))
+
+@test
+fn test_interning_is_what_makes_two_ids_comparable() [io]
+    test.case("tokenising each side alone gives tokens with unrelated ids")
+    let p = diffunit.exact_policy()
+    let left = diffunit.tokenize_one("x\ny\n", DiffLines, p)
+    let right = diffunit.tokenize_one("x\nz\n", DiffLines, p)
+    test.assert(diffunit.token_count(left) == 2)
+    test.assert(diffunit.token_count(right) == 2)
+
+    test.case("intern_pair puts them in one table, and the shared line then shares an id")
+    let input = diffunit.intern_pair(left, right)
+    test.assert(input.a.ids[0] == input.b.ids[0])
+    test.assert(input.a.ids[1] != input.b.ids[1])
+
+    test.case("and the text and the spans survived the re-interning untouched")
+    test.assert(diffunit.token_str(input.a, 1) == "y\n")
+
+@test
+fn test_three_inputs_share_one_table_because_a_merge_needs_them_to() [io]
+    test.case("tokenize3 answers the three sides interned together")
+    let t = diffunit.tokenize3("a\nb\n", "a\nB\n", "a\nb\nc\n", DiffLines,
+                               diffunit.exact_policy())
+    test.assert(diffunit.token_count(t.0) == 2)
+    test.assert(diffunit.token_count(t.1) == 2)
+    test.assert(diffunit.token_count(t.2) == 3)
+
+    test.case("the shared first line has one id across all three")
+    test.assert(t.0.ids[0] == t.1.ids[0])
+    test.assert(t.1.ids[0] == t.2.ids[0])
+
+@test
+fn test_the_two_unicode_granularities_are_the_standards_and_not_a_guess() [io]
+    test.case("a grapheme boundary is UAX #29's — the combining accent does not start one")
+    // "e" + U+0301 COMBINING ACUTE ACCENT is one cluster of three bytes.
+    let text = "e\u{0301}x"
+    test.assert(diffunit.grapheme_boundary(text, 0) == 0)
+    test.assert(diffunit.grapheme_boundary(text, 1) == 3)
+
+    test.case("word segments come back as unicode-nv's own values, with their kinds")
+    let segs = diffunit.word_segments("foo bar")
+    test.assert(list.len(segs) == 3)
+    var spaces = 0
+    for w in segs
+        match w.kind
+            WordSpace =>
+                spaces = spaces + 1
+            _         =>
+                pass
+    test.assert(spaces == 1)
+
+    test.case("and a word tokenisation covers the input — the spaces are tokens too")
+    let input = diffunit.tokenize("foo bar", "foo baz", DiffWords)
+    test.assert(diffunit.token_count(input.a) == 3)
+
+@test
+fn test_a_policy_is_a_value_and_the_two_named_ones_differ_in_one_field() [io]
+    test.case("the exact policy folds nothing")
+    let e = diffunit.exact_policy()
+    test.assert(not e.fold_ascii_case)
+    test.assert(not e.ignore_all_space)
+    test.assert(not e.ignore_trailing_space)
+    test.assert(not e.ignore_blank_lines)
+
+    test.case("diff -w's policy differs in exactly one field")
+    let w = diffunit.ignore_space_policy()
+    test.assert(w.ignore_all_space)
+    test.assert(not w.fold_ascii_case)
+
+    test.case("and an input carries the policy it was tokenised under")
+    let input = diffunit.tokenize_with("a\n", "a\n", DiffLines, w)
+    test.assert(input.policy.ignore_all_space)
+    test.assert(input.unit == DiffLines)

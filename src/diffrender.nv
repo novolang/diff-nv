@@ -1,0 +1,245 @@
+// diffrender.nv — an edit script as bytes: unified, side by side, or
+// as a list of lines somebody else paints.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE DECIDES WHERE THE BYTES GO.  Three shapes, and the
+// third is the one that makes this module `core` rather than `host`:
+//
+//   *_into(out: [u8], …) -> [u8]      append to the caller's buffer
+//   unified(…)           -> Str        allocate one string
+//   *_to<W: Write[e]>(w, …)            write to the caller's sink,
+//                                      charged what that sink costs
+//
+// The effect-polymorphic form is the direct answer to the thing a
+// caller most often wants — `novo fmt --check` writing a diff to
+// stdout, snapshot-nv writing one into a test report, a review tool
+// writing one to a socket. Its clause is `[e]`, bound by the `Write`
+// impl the caller supplies, so this package has spent nothing:
+// `[io]` for a terminal, `[fs]` for a file, nothing at all for a
+// buffer that implements `Write[]`. `docs/publishing.md` § How a core
+// package takes a stream from its host is the rule; this is the sink
+// half of it.
+//
+// THE LINE LIST IS NOT A CONVENIENCE.  `lines` answers the diff as
+// values — one row per displayed line, with the kind, the two line
+// numbers and the byte span — and an editor paints them itself. A
+// renderer that only produced bytes would force novim to parse its own
+// diff back out of a string to decide which rows to colour, and a
+// context line that begins with `-` would then be painted as a
+// deletion. Answering values first and bytes second is what stops
+// that, and it costs nothing: the byte renderers are written over the
+// same walk.
+//
+// THE HEADERS ARE `diff -u`'s, BYTE FOR BYTE.  `@@ -l,s +l,s @@`, with
+// the count omitted when it is 1, the start reported as 0 for an empty
+// range, and the section heading after the second `@@` when the caller
+// supplies one. That is not a style choice: a unified diff is an
+// interchange format, `patch(1)` and `git apply` both parse it, and a
+// renderer that is nearly right produces files that nearly apply.
+
+use diffunit
+use diffscript
+
+// The `---` and `+++` header lines a unified diff opens a file with.
+//
+// Both names and both timestamps are the caller's strings, verbatim.
+// This package does not invent them and cannot: the left name is a
+// path this package never read, and the timestamp is a clock a `core`
+// package does not have. An empty stamp writes the name alone, which
+// is what `git diff` does.
+pub struct DiffLabels
+    a_name: Str
+    b_name: Str
+    a_stamp: Str
+    b_stamp: Str
+
+// How a unified diff is written.
+pub struct DiffUnifiedOptions
+    // Unchanged tokens kept on each side of a change. `diff -U3` is 3.
+    context: Int
+    labels: DiffLabels
+    // Write `\ No newline at end of file` after a token that
+    // `diffunit.token_unterminated` reports. On by default, because a
+    // patch that omits it silently adds a newline when it is applied.
+    no_newline_marker: Bool
+    // The section heading written after a hunk's second `@@` — the
+    // function a hunk is inside, which `diff -p` finds and this package
+    // cannot, because finding it means parsing the language. A caller
+    // that knows supplies it per hunk through `unified_sections`; an
+    // empty list writes none.
+    sections: [Str]
+
+// A displayed line, for a caller that paints its own.
+pub enum DiffLineKind
+    // Present on both sides.
+    DiffLineContext
+    // Present on the left only. A `-` line.
+    DiffLineRemoved
+    // Present on the right only. A `+` line.
+    DiffLineAdded
+    // The `\ No newline at end of file` marker.
+    DiffLineMarker
+
+// One row of a rendered diff.
+pub struct DiffRenderLine
+    kind: DiffLineKind
+    // The 1-based line number on the left, or 0 where there is none.
+    a_line: Int
+    // The 1-based line number on the right, or 0 where there is none.
+    b_line: Int
+    // Where the text is, in the input the line came from. A caller
+    // reads it out of `input.a` for a context or removed line and out
+    // of `input.b` for an added one — which is why `kind` is first.
+    span: diffunit.DiffSpan
+    // Which hunk the line belongs to, indexing `diffscript.hunks`.
+    hunk: Int
+
+// How a side-by-side diff is laid out.
+pub struct DiffColumnOptions
+    context: Int
+    // Columns for each of the two text columns, not counting the
+    // gutter. Measured in TERMINAL COLUMNS, not bytes and not
+    // grapheme clusters: a caller supplies the width function, because
+    // this package will not decide for a GUI that an emoji is two
+    // cells wide.
+    width: Int
+    // Written between the two columns. ` | ` for a change, and the
+    // package substitutes ` ` for context, `<` for a deletion and `>`
+    // for an insertion in the middle position, as `diff -y` does.
+    gutter: Str
+    // Display width of one grapheme cluster, supplied by the caller.
+    // `unicode-nv`'s `uwidth.cluster_width` is the one a terminal
+    // wants; a proportional renderer supplies its own and gets the
+    // same layout arithmetic. A named function, not a lambda — a
+    // lambda would cost the caller a closure for something that is
+    // always one of two answers.
+    cluster_width: fn(Str) -> Int
+    // Wrap a line too wide for its column onto the next row rather than
+    // truncating it with an ellipsis.
+    wrap: Bool
+
+// `diff -U3` with no file names.
+pub fn unified_options(context: Int) -> DiffUnifiedOptions []
+    todo("diff-nv.diffrender.unified_options")
+
+// `diff -U3` with the two names and no timestamps, which is what
+// `git diff` writes.
+pub fn unified_options_named(context: Int, a_name: Str, b_name: Str) -> DiffUnifiedOptions []
+    todo("diff-nv.diffrender.unified_options_named")
+
+// Append a whole unified diff to `out` and answer it.
+//
+// ```novo
+// use diffunit
+// use diffscript
+// use diffrender
+//
+// let input = diffunit.tokenize("a\nb\n", "a\nc\n", DiffLines)
+// let s = diffscript.diff(input, diffscript.default_options())
+// let o = diffrender.unified_options_named(3, "old.txt", "new.txt")
+// let empty: [u8] = []
+// let buf = diffrender.unified_into(empty, input, s, o)
+// println(str.from_int(list.len(buf)))
+// ```
+pub fn unified_into(out: [u8], input: diffunit.DiffInput, s: diffscript.DiffScript,
+                    o: DiffUnifiedOptions) -> [u8] []
+    todo("diff-nv.diffrender.unified_into")
+
+// The same diff as a `Str`. THIS ALLOCATES; `unified_into` is the call
+// for a caller that already has a buffer.
+pub fn unified(input: diffunit.DiffInput, s: diffscript.DiffScript, o: DiffUnifiedOptions) -> Str []
+    todo("diff-nv.diffrender.unified")
+
+// Write a unified diff to the caller's sink, charged what the sink
+// costs.
+//
+// THE EFFECT-POLYMORPHIC SHAPE. `[e]` is the `Write` impl's row, so a
+// terminal costs `[io]`, a file costs `[fs]` and an in-memory buffer
+// costs nothing — and this package's own budget stays `[]` because it
+// has declared "whatever you hand me" rather than spending anything.
+//
+// The answer is `?IoError`: `None` when every byte went out. Nothing
+// else can go wrong — a script and its input are already consistent by
+// construction, so the only failure is the caller's transport.
+//
+// ```novo
+// use diffunit
+// use diffscript
+// use diffrender
+//
+// fn write_diff(w: File, a: Str, b: Str) -> ?IoError [io, fs]
+//     let input = diffunit.tokenize(a, b, DiffLines)
+//     let s = diffscript.diff(input, diffscript.default_options())
+//     diffrender.unified_to(w, input, s, diffrender.unified_options(3))
+// ```
+pub fn unified_to<W: Write[e]>(w: W, input: diffunit.DiffInput, s: diffscript.DiffScript,
+                               o: DiffUnifiedOptions) -> ?IoError [e]
+    todo("diff-nv.diffrender.unified_to")
+
+// Append one `@@ -l,s +l,s @@` header to `out`.
+//
+// Published separately because a caller rendering its own body still
+// wants the header exactly right, and because getting it wrong is the
+// most common way a hand-written unified diff fails to apply: the
+// count is omitted when it is 1, and the start is 0 rather than 1 when
+// the range is empty.
+pub fn hunk_header_into(out: [u8], h: diffscript.DiffHunk, section: Str) -> [u8] []
+    todo("diff-nv.diffrender.hunk_header_into")
+
+// The diff as rows a caller paints itself. See the module comment:
+// this is the shape an editor and a TUI want, and the one a byte
+// renderer cannot be parsed back into safely.
+//
+// ```novo
+// use diffunit
+// use diffscript
+// use diffrender
+//
+// let input = diffunit.tokenize("a\nb\n", "a\nc\n", DiffLines)
+// let s = diffscript.diff(input, diffscript.default_options())
+// for row in diffrender.lines(input, s, 3)
+//     match row.kind
+//         DiffLineRemoved => println("-")
+//         DiffLineAdded   => println("+")
+//         _               => println(" ")
+// ```
+pub fn lines(input: diffunit.DiffInput, s: diffscript.DiffScript,
+             context: Int) -> [DiffRenderLine] []
+    todo("diff-nv.diffrender.lines")
+
+// Side-by-side layout, `diff -y`'s.
+pub fn column_options(width: Int, cluster_width: fn(Str) -> Int) -> DiffColumnOptions []
+    todo("diff-nv.diffrender.column_options")
+
+// Append a side-by-side diff to `out`.
+pub fn side_by_side_into(out: [u8], input: diffunit.DiffInput, s: diffscript.DiffScript,
+                         o: DiffColumnOptions) -> [u8] []
+    todo("diff-nv.diffrender.side_by_side_into")
+
+// Write a side-by-side diff to the caller's sink, charged what the
+// sink costs.
+pub fn side_by_side_to<W: Write[e]>(w: W, input: diffunit.DiffInput, s: diffscript.DiffScript,
+                                    o: DiffColumnOptions) -> ?IoError [e]
+    todo("diff-nv.diffrender.side_by_side_to")
+
+// A one-line summary: `3 files changed, 12 insertions(+), 4 deletions(-)`
+// for one file's counts, in git's own wording.
+//
+// Here rather than in `diffscript` because it is a rendering: the
+// numbers are `diffscript.counts`, and a caller writing its own summary
+// uses those.
+pub fn stat_line_into(out: [u8], name: Str, deleted: Int, inserted: Int) -> [u8] []
+    todo("diff-nv.diffrender.stat_line_into")
+
+// Word-level marks inside one changed pair of lines: the byte spans in
+// the left line that were removed and in the right line that were
+// added, from `diffscript.refine`.
+//
+// Answered as two lists of spans rather than as text, so a terminal can
+// invert them, an HTML renderer can wrap them and a plain renderer can
+// ignore them — none of which is possible once they have been rendered
+// into a string with markers in it.
+pub fn inline_marks(input: diffunit.DiffInput, refined: diffscript.DiffScript,
+                    at: diffscript.DiffOp) -> ([diffunit.DiffSpan], [diffunit.DiffSpan]) []
+    todo("diff-nv.diffrender.inline_marks")

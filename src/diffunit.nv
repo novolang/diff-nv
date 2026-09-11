@@ -1,0 +1,269 @@
+// diffunit.nv — what a diff is OVER.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ALGORITHM NEVER SEES TEXT.  A diff is computed over two lists of
+// integers and nothing else.  This module is what turns two strings
+// into those lists: it cuts each input into tokens at a granularity
+// the caller picks, gives equal tokens equal ids, and keeps the byte
+// span of every token beside its id.  `diffscript` then does pure
+// integer work, and `diffrender`, `diffpatch` and `diffmerge` come
+// back here when they need bytes.
+//
+// Three things follow from that split, and they are the reason for it.
+//
+//   1. Lines, words and grapheme clusters are ONE algorithm.  The
+//      granularity is a tokeniser, not a code path, so the O(ND) walk,
+//      the patience walk and the histogram walk are each written once.
+//
+//   2. The equivalence is separable from the text.  `DiffTokenPolicy`
+//      changes which tokens get the SAME ID and changes nothing else —
+//      so `git diff -w` and `git diff` differ by one boolean, and both
+//      render the caller's original bytes, because the spans were never
+//      folded.  A tokeniser that lower-cased its output would render
+//      a lower-cased file.
+//
+//   3. A caller with tokens of its own can skip this module.  A
+//      snapshot library diffing two lists of records, a test harness
+//      diffing two syntax trees, a log viewer diffing two event
+//      streams — each interns its own values and calls
+//      `diffscript.diff_ids` directly.  That is why the integer entry
+//      point is public rather than an implementation detail.
+//
+// TWO INTERVALS, AND THEY ARE NOT THE SAME TYPE.  `DiffSpan` is a byte
+// range into a `Str`.  `DiffRange` is a token-index range into a
+// `DiffTokens`.  Confusing them is the classic diff defect — a hunk
+// header printed with byte offsets where line numbers belong, a slice
+// taken with a token index — so they are two types and the compiler
+// refuses the confusion.  `range_span` is the only bridge, and it is
+// spelled out loud at every call site that needs it.
+
+use ugrapheme
+
+// A byte range into a `Str`: `[start, end)`, both counted in bytes from
+// the start of the string the range belongs to.
+//
+// Half-open, because that is the only convention under which an empty
+// range at a position is expressible and two adjacent ranges meet
+// without overlapping — both of which a diff produces constantly.
+pub struct DiffSpan
+    start: Int
+    end: Int
+
+// A token-index range into a `DiffTokens`: `[start, end)`, counted in
+// TOKENS, not bytes.
+//
+// For `DiffLines` this is a line-number range, which is what a `@@`
+// header carries — and the reason a unified hunk header can be written
+// without ever converting to bytes.
+pub struct DiffRange
+    start: Int
+    end: Int
+
+// The granularity a diff is taken at.
+pub enum DiffUnit
+    // One token per line.  The line terminator belongs to the token it
+    // ends, so a file whose last line has no newline is distinguishable
+    // from one whose last line has one — which is exactly what the
+    // `\ No newline at end of file` marker exists to report, and what a
+    // tokeniser that stripped terminators could not represent.
+    DiffLines
+    // One token per UAX #29 word, with the runs between words their own
+    // tokens so that the concatenation of every token is the input.
+    // Used for the word-level refinement inside a changed line, which
+    // is what makes a prose diff readable.
+    DiffWords
+    // One token per extended grapheme cluster (UAX #29).  Not per byte
+    // and not per codepoint: a combining accent and a family emoji are
+    // each one token, so a character diff never cuts a cluster in half
+    // and hands a renderer bytes that do not print.
+    DiffGraphemes
+
+// Which tokens count as EQUAL, without changing what gets rendered.
+//
+// Every field here affects the ids only.  The spans are always the
+// caller's original bytes, so a diff taken with `ignore_all_space`
+// still renders the file that is on disk.  That separation is the
+// whole reason the policy is a value rather than a pre-pass over the
+// input text.
+pub struct DiffTokenPolicy
+    // ASCII case only.  Unicode case folding is `ucase.fold`, and it is
+    // deliberately NOT here: folding a token needs the case tables,
+    // which are 245 KB of data this package would then make every
+    // consumer carry to diff two log files.  A caller who wants it
+    // folds its own tokens and calls `diffscript.diff_ids`.
+    fold_ascii_case: Bool
+    // Trailing horizontal whitespace does not distinguish two tokens.
+    ignore_trailing_space: Bool
+    // No horizontal whitespace distinguishes two tokens, anywhere.
+    // `git diff -w`.
+    ignore_all_space: Bool
+    // A run of blank lines matches a run of any other length, including
+    // none.  `git diff --ignore-blank-lines`.
+    ignore_blank_lines: Bool
+
+// One input, cut into tokens.
+//
+// `text` is the caller's string, unchanged and uncopied. `spans[i]` is
+// where token `i` sits in it, and `ids[i]` is the token's identity
+// under the policy the tokeniser ran with: `ids[i] == ids[j]` exactly
+// when tokens `i` and `j` are the same token to the diff.
+//
+// `spans` and `ids` are the same length, and the spans are in order and
+// cover `text` with no gap — a property `diffrender` relies on to write
+// a hunk by concatenating spans.
+pub struct DiffTokens
+    text: Str
+    spans: [DiffSpan]
+    ids: [Int]
+
+// The two inputs, tokenised against each OTHER.
+//
+// Tokenising the two sides together is not an optimisation, it is the
+// requirement: an id means "the same token" only if both sides were
+// interned into one table. Two `DiffTokens` produced by separate calls
+// have unrelated ids and must not be diffed.
+pub struct DiffInput
+    // The left-hand, "before", `---` side.
+    a: DiffTokens
+    // The right-hand, "after", `+++` side.
+    b: DiffTokens
+    unit: DiffUnit
+    policy: DiffTokenPolicy
+
+// The policy that distinguishes everything from everything — no
+// folding, no whitespace rules. The default, and what `diff` does with
+// no flags.
+//
+// ```novo
+// use diffunit
+//
+// let p = diffunit.exact_policy()
+// println(if p.ignore_all_space then "folded" else "exact")
+// ```
+pub fn exact_policy() -> DiffTokenPolicy []
+    todo("diff-nv.diffunit.exact_policy")
+
+// `diff -w`: horizontal whitespace does not distinguish two tokens.
+pub fn ignore_space_policy() -> DiffTokenPolicy []
+    todo("diff-nv.diffunit.ignore_space_policy")
+
+// Tokenise both inputs against each other at `unit`, exactly.
+//
+// ```novo
+// use diffunit
+//
+// let input = diffunit.tokenize("a\nb\n", "a\nc\n", DiffLines)
+// println(str.from_int(diffunit.token_count(input.a)))   // 2
+// ```
+pub fn tokenize(a: Str, b: Str, unit: DiffUnit) -> DiffInput []
+    todo("diff-nv.diffunit.tokenize")
+
+// Tokenise both inputs against each other under `policy`.
+pub fn tokenize_with(a: Str, b: Str, unit: DiffUnit, policy: DiffTokenPolicy) -> DiffInput []
+    todo("diff-nv.diffunit.tokenize_with")
+
+// Tokenise three inputs against each other — the shape `diffmerge`
+// needs, because a three-way merge compares base against ours and base
+// against theirs and the two comparisons must share one id table.
+pub fn tokenize3(base: Str, ours: Str, theirs: Str, unit: DiffUnit,
+                 policy: DiffTokenPolicy) -> (DiffTokens, DiffTokens, DiffTokens) []
+    todo("diff-nv.diffunit.tokenize3")
+
+// How many tokens `t` holds.
+pub fn token_count(t: DiffTokens) -> Int []
+    todo("diff-nv.diffunit.token_count")
+
+// Where token `i` sits in `t.text`. A zero span for an index out of
+// range, because a renderer walking a range past the end should emit
+// nothing rather than stop the program.
+pub fn token_span(t: DiffTokens, i: Int) -> DiffSpan []
+    todo("diff-nv.diffunit.token_span")
+
+// The bytes of token `i`, as a `Str`. THIS ALLOCATES — it is the call
+// a caller makes for the tokens it is about to show a person, and the
+// one `diffrender` does not make.
+pub fn token_str(t: DiffTokens, i: Int) -> Str []
+    todo("diff-nv.diffunit.token_str")
+
+// The byte span covering a whole token range: from the start of its
+// first token to the end of its last. THE ONLY BRIDGE between the two
+// interval types.
+//
+// An empty range answers an empty span positioned where the range
+// begins, which is what an insertion point is.
+//
+// ```novo
+// use diffunit
+//
+// let input = diffunit.tokenize("one\ntwo\n", "one\n", DiffLines)
+// let s = diffunit.range_span(input.a, DiffRange { start: 1, end: 2 })
+// println(str.from_int(s.start))   // 4
+// ```
+pub fn range_span(t: DiffTokens, r: DiffRange) -> DiffSpan []
+    todo("diff-nv.diffunit.range_span")
+
+// The bytes a span covers, as a `Str`. THIS ALLOCATES.
+pub fn span_str(t: DiffTokens, s: DiffSpan) -> Str []
+    todo("diff-nv.diffunit.span_str")
+
+// How many tokens a range covers.
+pub fn range_len(r: DiffRange) -> Int []
+    todo("diff-nv.diffunit.range_len")
+
+// Whether a range covers no tokens.
+pub fn range_empty(r: DiffRange) -> Bool []
+    todo("diff-nv.diffunit.range_empty")
+
+// Whether the token at `i` ends without a line terminator — true only
+// for the last token of a `DiffLines` tokenisation of a file that does
+// not end in a newline.
+//
+// This is the fact `\ No newline at end of file` reports, and the one
+// a patch applier has to preserve. A caller that concatenates tokens
+// blindly across the two sides of such a diff produces a file with a
+// newline the original did not have.
+pub fn token_unterminated(t: DiffTokens, i: Int) -> Bool []
+    todo("diff-nv.diffunit.token_unterminated")
+
+// The line number, counted from 1, that byte offset `at` falls on —
+// for a caller mapping a diff back onto an editor's cursor.
+pub fn line_of_byte(t: DiffTokens, at: Int) -> Int []
+    todo("diff-nv.diffunit.line_of_byte")
+
+// Tokenise ONE string, for a caller building the two sides itself —
+// a snapshot library holding the old text and the new text in
+// different places. The two results must be re-interned with
+// `intern_pair` before they are diffed.
+pub fn tokenize_one(text: Str, unit: DiffUnit, policy: DiffTokenPolicy) -> DiffTokens []
+    todo("diff-nv.diffunit.tokenize_one")
+
+// Re-intern two separately tokenised inputs into one id table, so they
+// can be diffed. Answers the same tokens with new ids; the spans and
+// the text are untouched.
+pub fn intern_pair(a: DiffTokens, b: DiffTokens) -> DiffInput []
+    todo("diff-nv.diffunit.intern_pair")
+
+// The next grapheme-cluster boundary at or after `at`, as
+// `ugrapheme.next_boundary` defines it.
+//
+// Published because a renderer that truncates a line to a column width
+// needs it and should not take unicode-nv itself to get it, and
+// because it is the one place this package's `DiffGraphemes`
+// tokenisation is observable from outside.
+pub fn grapheme_boundary(text: Str, at: Int) -> Int []
+    todo("diff-nv.diffunit.grapheme_boundary")
+
+// The word segmentation `DiffWords` cuts on, answered as unicode-nv's
+// own segments.
+//
+// The type crosses the package boundary on purpose. `DiffWords` is
+// UAX #29's word boundaries and not "split on spaces", and the honest
+// way to say so in a signature is to hand back the segments the
+// standard defines rather than to re-describe them in a type of this
+// package's own. A caller inspecting what the tokeniser will do — a
+// prose differ deciding whether a word diff is worth the second
+// pass — reads `WordSpace` and `WordLetters` here, the same names
+// unicode-nv's own consumers read.
+pub fn word_segments(text: Str) -> [ugrapheme.UniWord] []
+    todo("diff-nv.diffunit.word_segments")
