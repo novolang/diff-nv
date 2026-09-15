@@ -5,6 +5,10 @@ All notable changes to diff-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -52,3 +56,22 @@ The **interface**: every signature and every effect row, and no bodies.
 - The scaffold's `src/diff.nv` was renamed: `diff` is a module name a
   consumer's own tree is likely to want, and module names collide on
   the same terms as type names.
+
+### Design notes
+
+The consumers the surface was designed against. novim has no diff and
+two places want one: its LSP client sends `textDocument/didChange` with
+the whole document on every debounced keystroke, where the protocol's
+incremental form wants ranges with replacement text, which is
+`diffrender.lines` over a `DiffLines` script; and it has no `:diff`
+command and no gutter marks, which is the same row list painted with
+novim's own attributes. snapshot-nv is planned as snapshot assertions
+over this package and needs `diffscript.unchanged` and
+`diffrender.unified`. `novo fmt --check` needs the same two over a
+`minimal_options()` script.
+
+The module names. The scaffold's `src/diff.nv` was renamed before the
+first build: module names collide across a whole assembly on the same
+terms as type names, and `diff` is a name a consumer's own tree is
+likely to want. Hence `diffunit`, `diffscript`, `diffrender`,
+`diffpatch` and `diffmerge`.

@@ -1,6 +1,6 @@
 [package]
 name        = "diff-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Myers, patience and histogram diff over lines, words or grapheme clusters, answered as an edit script of typed operations over TOKEN INDICES with the byte spans kept beside them; unified and side-by-side rendering into a caller's buffer with `diff -u`'s own `@@` headers; unified-patch parsing and application with fuzz and a reject list; and a three-way merge that answers its conflicts as values as well as markers.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
