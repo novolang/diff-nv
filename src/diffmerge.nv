@@ -1,67 +1,62 @@
 // diffmerge.nv — three inputs, one output, and the conflicts as values.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A three-way merge takes a common ancestor, the base, and two texts
+// derived from it, ours and theirs, and produces one text.  The base is
+// diffed against each side.  Where the two diffs agree that a run of
+// base tokens is unchanged on both sides, the run is stable.  Between
+// two stable runs lies a chunk: if only one side changed it, that side
+// is taken; if both changed it the same way, the change is taken once;
+// otherwise the chunk is a conflict.  This is the diff3 algorithm, as
+// Khanna, Kunal and Pierce describe it in "A Formal Investigation of
+// Diff3" (2007).
 //
-// **A CONFLICT IS A VALUE AND THE MARKERS ARE A RENDERING OF IT.**  A
-// merge that answers only text with `<<<<<<<` in it makes every
-// consumer parse its own output back: a merge tool to show the two
-// sides, a test to assert the merge was clean, a build to decide
-// whether to stop. And that reparse is wrong exactly when it matters —
-// a file whose own content contains a marker line, which is every file
-// that documents merge conflicts, including this one. So `merge3`
-// answers `DiffMergeResult` with the conflicts as token ranges into
-// all three inputs, and the marker text beside them.
+// `merge3` answers each conflict as a `DiffConflict`, with token ranges
+// into all three inputs, and writes it into the text between marker
+// lines.  A caller asking whether a merge is clean reads the values and
+// never parses markers back.  Parsing them back is wrong for a file
+// whose own content holds marker lines, which is what
+// `DiffMergeOptions.marker_size` is for: seven is git's default, and a
+// file that documents merge conflicts needs longer markers.
 //
-// `conflicts_only` exists for the caller who wants the question and
-// not the answer: is this merge clean? It is the call a pre-merge
-// check makes, and it renders nothing.
-//
-// MARKER SIZE IS A FIELD BECAUSE GIT MADE IT ONE.  `conflict-marker-size`
-// exists because a file that legitimately contains seven `<` at the
-// start of a line — a diff in a test fixture, a document about merging —
-// produces a merged file no tool can read back. Seven is the default
-// and the field is how a caller merging such a file says so.
-//
-// THE BASE IS NOT OPTIONAL.  There is no two-way merge here. Merging
-// two files with no common ancestor is guessing, and the guess is
-// wrong in the direction that loses work; a caller who has no base
-// passes the empty string, which makes every difference a conflict,
-// which is the honest answer.
+// There is no two-way merge.  A caller with no common ancestor passes
+// the empty string as the base, which makes every difference a
+// conflict.
 
+use std.str
+use std.list
+use std.bytes
 use diffunit
 use diffscript
 
 // How a conflict is written into the output.
 pub enum DiffMergeStyle
-    // `<<<<<<< ours`, `=======`, `>>>>>>> theirs`. git's default.
+    // `<<<<<<< ours`, `=======`, `>>>>>>> theirs`.  git's default.
     DiffMergeTwoSided
-    // The same with `||||||| base` and the base's text between the
-    // ours side and the `=======`. git's `diff3`, and the one that
-    // lets a person see what was actually changed rather than only
-    // what it became.
+    // The same with `||||||| base` and the base's text between the ours
+    // side and the `=======`.  git's `diff3`.
     DiffMergeDiff3
-    // `diff3`, with the common leading and trailing lines of the three
-    // sides moved out of the conflict first, so the markers surround
-    // only what actually differs. git's `zdiff3`.
+    // `diff3`, with the leading and trailing tokens the two sides share
+    // moved out of the conflict first, so the markers surround only
+    // what differs.  git's `zdiff3`.
     DiffMergeZealousDiff3
 
-// What to do with a conflict instead of reporting it.
+// What to do with a conflict instead of marking it.
 pub enum DiffMergeFavor
-    // Report it. The default.
+    // Mark it.  The default.
     DiffFavorNone
-    // Take the left side and record the conflict anyway, so a caller
-    // can tell an automatic resolution from a clean merge. `git merge
-    // -Xours`.
+    // Take the left side, and record the conflict as resolved, so a
+    // caller can tell an automatic resolution from a clean merge.
+    // `git merge -Xours`.
     DiffFavorOurs
     // Take the right side, and the same.
     DiffFavorTheirs
-    // Take both, left first, with no markers. `diff3 -m --union`. The
-    // right answer for an append-only file — a changelog, a list of
-    // hosts — and the wrong one for anything else, which is why it is
-    // named rather than default.
+    // Take both, ours first, with no markers.  `git merge-file
+    // --union`.  Right for an append-only file such as a changelog and
+    // wrong for most others.
     DiffFavorUnion
 
-// The three names written after the markers.
+// The three names written after the markers.  An empty name writes the
+// marker alone.
 pub struct DiffMergeLabels
     base: Str
     ours: Str
@@ -69,113 +64,376 @@ pub struct DiffMergeLabels
 
 // How a merge runs.
 pub struct DiffMergeOptions
-    // The granularity the three-way comparison is taken at. `DiffLines`
-    // for source; `DiffWords` for prose, which turns a paragraph two
-    // people reflowed from a whole-paragraph conflict into the words
-    // that actually differ.
+    // The granularity the comparison is taken at.  `DiffLines` for
+    // source; `DiffWords` for prose, where two edits to different words
+    // of one line then merge.
     unit: diffunit.DiffUnit
     policy: diffunit.DiffTokenPolicy
     style: DiffMergeStyle
     favor: DiffMergeFavor
-    // Repeats of each marker character. Seven, unless the file being
-    // merged contains marker-looking lines of its own.
+    // Repeats of each marker character.  Seven, unless the files being
+    // merged contain marker-looking lines of their own.
     marker_size: Int
     labels: DiffMergeLabels
-    // The diff options both of the two comparisons run with.
+    // The options both diffs against the base run with.
     diff: diffscript.DiffOptions
 
 // One conflicting region, in all three inputs.
 //
-// Three ranges and not two: the base range is what makes a conflict
-// reviewable, because "these two lines differ" is a much weaker
-// statement than "these two lines both changed from THAT one". A
-// caller rendering `DiffMergeTwoSided` ignores it; one rendering
-// `diff3` writes it out; a merge tool shows all three columns.
+// The base range says what both sides changed, which is what makes a
+// conflict reviewable.  A two-sided rendering leaves it out; `diff3`
+// writes it.
 pub struct DiffConflict
     base: diffunit.DiffRange
     ours: diffunit.DiffRange
     theirs: diffunit.DiffRange
     // True when `favor` resolved this region rather than marking it.
-    // A caller that asked for `DiffFavorOurs` still needs to know
-    // which regions it silently chose for — that is the difference
-    // between a clean merge and one somebody should look at.
     resolved: Bool
 
 // What a merge produced.
 pub struct DiffMergeResult
     text: Str
     conflicts: [DiffConflict]
-    // Regions that differed and merged without a conflict — one side
-    // changed and the other did not. The number a caller reports as
-    // "merged 7 changes".
+    // Regions that differed from the base and merged without a
+    // conflict: one side changed them, or both changed them the same
+    // way.
     merged: Int
 
-// git's defaults: line granularity, two-sided markers, seven
-// characters, no favouring.
-pub fn merge_options() -> DiffMergeOptions []
-    todo("diff-nv.diffmerge.merge_options")
-
-// `zdiff3` with the three labels filled in, which is what a version
-// control system that wants a person to resolve the conflict should
-// write.
-pub fn diff3_options(base: Str, ours: Str, theirs: Str) -> DiffMergeOptions []
-    todo("diff-nv.diffmerge.diff3_options")
-
-// Merge `ours` and `theirs` over their common ancestor `base`.
+// git's defaults: line granularity, two-sided markers of seven
+// characters labelled `ours` and `theirs`, no favouring.
 //
 // ```novo
 // use diffmerge
 //
-// let r = diffmerge.merge3("a\n", "a\nb\n", "a\nc\n", diffmerge.merge_options())
-// println(if diffmerge.clean(r) then "clean" else "conflicts")
+// println(str.from_int(diffmerge.merge_options().marker_size))   // 7
+// ```
+pub fn merge_options() -> DiffMergeOptions []
+    DiffMergeOptions { unit: DiffLines, policy: diffunit.exact_policy(),
+                       style: DiffMergeTwoSided, favor: DiffFavorNone, marker_size: 7,
+                       labels: DiffMergeLabels { base: "base", ours: "ours", theirs: "theirs" },
+                       diff: diffscript.default_options() }
+
+// `zdiff3` with the three labels filled in: what a version control
+// system that wants a person to resolve the conflict should write.
+//
+// ```novo
+// use diffmerge
+//
+// println(diffmerge.diff3_options("o", "a", "b").labels.ours)   // a
+// ```
+pub fn diff3_options(base: Str, ours: Str, theirs: Str) -> DiffMergeOptions []
+    DiffMergeOptions { unit: DiffLines, policy: diffunit.exact_policy(),
+                       style: DiffMergeZealousDiff3, favor: DiffFavorNone, marker_size: 7,
+                       labels: DiffMergeLabels { base: base, ours: ours, theirs: theirs },
+                       diff: diffscript.default_options() }
+
+// Merge `ours` and `theirs` over their common ancestor `base`.
+//
+// Unchanged regions are written from `ours`, so under a policy that
+// ignores whitespace the merged text keeps our side's spelling.
+//
+// ```novo
+// use diffmerge
+//
+// let r = diffmerge.merge3("a\n", "a\nb\n", "a\n", diffmerge.merge_options())
+// println(if diffmerge.clean(r) then "clean" else "conflicts")   // clean
 // ```
 pub fn merge3(base: Str, ours: Str, theirs: Str, o: DiffMergeOptions) -> DiffMergeResult []
-    todo("diff-nv.diffmerge.merge3")
+    let t = merge_tokens(base, ours, theirs, o)
+    var w = MergeWriter { parts: [], at_line_start: true, conflicts: [], merged: 0 }
+    run_merge(w, t.0, t.1, t.2, o)
+    DiffMergeResult { text: str.join(w.parts, ""), conflicts: w.conflicts[:], merged: w.merged }
 
-// Merge, appending the output to the caller's buffer. The conflicts
-// come back beside it because they are not bytes.
-pub fn merge3_into(out: [u8], base: Str, ours: Str, theirs: Str,
+// Merge, appending the output to the caller's buffer.  The conflicts
+// come back beside it.
+//
+// ```novo
+// use diffmerge
+//
+// var buf: [u8] = []
+// let r = diffmerge.merge3_into(buf, "a\n", "b\n", "c\n", diffmerge.merge_options())
+// println(str.from_int(list.len(r.1)))   // 1
+// ```
+pub fn merge3_into(var out: [u8], base: Str, ours: Str, theirs: Str,
                    o: DiffMergeOptions) -> ([u8], [DiffConflict]) []
-    todo("diff-nv.diffmerge.merge3_into")
+    let r = merge3(base, ours, theirs, o)
+    list.append(out, bytes.to_byte_list(bytes.from_str(r.text)))
+    (out, r.conflicts[:])
 
-// The conflicts alone, with nothing rendered. The call a pre-merge
-// check makes: an empty list means the merge would be clean.
+// The unresolved conflicts alone.  The call a pre-merge check makes: an
+// empty list means the merge would be clean.
+//
+// ```novo
+// use diffmerge
+//
+// let cs = diffmerge.conflicts_only("a\n", "b\n", "c\n", diffmerge.merge_options())
+// println(str.from_int(list.len(cs)))   // 1
+// ```
 pub fn conflicts_only(base: Str, ours: Str, theirs: Str, o: DiffMergeOptions) -> [DiffConflict] []
-    todo("diff-nv.diffmerge.conflicts_only")
+    var out: [DiffConflict] = []
+    for c in merge3(base, ours, theirs, o).conflicts
+        if not c.resolved
+            list.push(out, c)
+    out
 
-// Whether the merge produced no UNRESOLVED conflict. A region that
+// Whether the merge produced no unresolved conflict.  A region that
 // `favor` resolved does not make a merge dirty, and `conflicts` still
 // lists it.
+//
+// ```novo
+// use diffmerge
+//
+// let r = diffmerge.merge3("a\n", "b\n", "c\n", diffmerge.merge_options())
+// println(if diffmerge.clean(r) then "clean" else "conflicts")   // conflicts
+// ```
 pub fn clean(r: DiffMergeResult) -> Bool []
-    todo("diff-nv.diffmerge.clean")
+    for c in r.conflicts
+        if not c.resolved
+            return false
+    true
 
 // The three tokenised inputs a caller needs to read a conflict's
-// ranges — the same interning `merge3` used, so the ranges line up.
+// ranges: the same numbering `merge3` used, so the ranges line up.
 //
-// Answered as a separate call rather than carried inside the result
-// because a caller that only wants the merged text should not pay to
-// keep three token tables alive.
+// ```novo
+// use diffmerge
+//
+// let t = diffmerge.merge_tokens("a\n", "b\n", "c\n", diffmerge.merge_options())
+// print(diffunit.token_str(t.1, 0))   // b
+// ```
 pub fn merge_tokens(base: Str, ours: Str, theirs: Str,
                     o: DiffMergeOptions) -> (diffunit.DiffTokens, diffunit.DiffTokens, diffunit.DiffTokens) []
-    todo("diff-nv.diffmerge.merge_tokens")
+    diffunit.tokenize3(base, ours, theirs, o.unit, o.policy)
 
-// Append one conflict's markers and bodies to `out`, for a caller
-// rendering a resolution of its own making.
-pub fn conflict_into(out: [u8], c: DiffConflict, base: diffunit.DiffTokens,
+// Append one conflict's markers and bodies to `out`, in `o.style`, for
+// a caller rendering a resolution of its own.  A zealous `diff3` style
+// is written as `diff3` here, since the trimming belongs to the merge.
+//
+// ```novo
+// use diffmerge
+//
+// let o = diffmerge.merge_options()
+// let r = diffmerge.merge3("a\n", "b\n", "c\n", o)
+// let t = diffmerge.merge_tokens("a\n", "b\n", "c\n", o)
+// var buf: [u8] = []
+// diffmerge.conflict_into(buf, r.conflicts[0], t.0, t.1, t.2, o)
+// print(bytes.byte_list_to_str(buf))
+// ```
+pub fn conflict_into(var out: [u8], c: DiffConflict, base: diffunit.DiffTokens,
                      ours: diffunit.DiffTokens, theirs: diffunit.DiffTokens,
                      o: DiffMergeOptions) -> [u8] []
-    todo("diff-nv.diffmerge.conflict_into")
+    var w = MergeWriter { parts: [], at_line_start: true, conflicts: [], merged: 0 }
+    write_markers(w, c, base, ours, theirs, o)
+    list.append(out, bytes.to_byte_list(bytes.from_str(str.join(w.parts, ""))))
+    out
 
-// The marker lines a given `marker_size` and label produce, as
-// `(open, base, divider, close)` — published so a tool that scans a
-// working tree for unresolved conflicts looks for the same bytes this
-// package writes, rather than for seven characters it hard-coded.
+// The marker lines `o` writes, without their newlines, as `(open, base,
+// divider, close)`.  A tool scanning a working tree for unresolved
+// conflicts looks for these.
+//
+// ```novo
+// use diffmerge
+//
+// println(diffmerge.markers(diffmerge.merge_options()).0)   // <<<<<<< ours
+// ```
 pub fn markers(o: DiffMergeOptions) -> (Str, Str, Str, Str) []
-    todo("diff-nv.diffmerge.markers")
+    (marker("<", o.marker_size, o.labels.ours), marker("|", o.marker_size, o.labels.base),
+     str.repeat("=", o.marker_size), marker(">", o.marker_size, o.labels.theirs))
 
-// Whether `text` contains a line that would be read back as a conflict
-// marker at this `marker_size` — the check a caller makes on the three
-// inputs BEFORE merging them, since that is the case `marker_size`
-// exists for and the only moment at which it can still be raised.
+// Whether `text` has a line that would be read back as a conflict
+// marker at this `marker_size`: exactly that many `<`, `|`, `=` or `>`
+// at the start of a line, followed by a space or the end of the line.
+// The check a caller makes on the three inputs before merging, to
+// choose a larger size.
+//
+// ```novo
+// use diffmerge
+//
+// println(if diffmerge.has_marker_lines("<<<<<<< x\n", 7) then "yes" else "no")   // yes
+// ```
 pub fn has_marker_lines(text: Str, marker_size: Int) -> Bool []
-    todo("diff-nv.diffmerge.has_marker_lines")
+    let n = str.len(text)
+    var at = 0
+    for _ in 0..n + 1
+        if at >= n
+            break
+        if marker_at(text, at, marker_size)
+            return true
+        match str.index_from(text, "\n", at)
+            Some(k) =>
+                at = k + 1
+            None    =>
+                break
+    false
+
+// ── The merge ─────────────────────────────────────────────────────────
+
+// The merged text as it is written, the conflicts met, and the count of
+// regions merged without one.
+struct MergeWriter
+    var parts: [Str]
+    var at_line_start: Bool
+    var conflicts: [DiffConflict]
+    var merged: Int
+
+// Append `s`, which is never empty.
+fn write(var w: MergeWriter, s: Str)
+    list.push(w.parts, s)
+    w.at_line_start = str.ends_with(s, "\n")
+
+fn write_range(var w: MergeWriter, t: diffunit.DiffTokens, r: diffunit.DiffRange)
+    if not diffunit.range_empty(r)
+        write(w, diffunit.span_str(t, diffunit.range_span(t, r)))
+
+// A marker line, begun on a fresh line.
+fn write_marker(var w: MergeWriter, line: Str)
+    if not w.at_line_start
+        write(w, "\n")
+    write(w, line + "\n")
+
+fn marker(ch: Str, size: Int, label: Str) -> Str
+    if label == ""
+        str.repeat(ch, size)
+    else
+        str.repeat(ch, size) + " " + label
+
+// Where each base token sits on the other side, or -1.
+fn alignment(base: diffunit.DiffTokens, side: diffunit.DiffTokens,
+             o: diffscript.DiffOptions) -> [Int]
+    var at: [Int] = []
+    for _ in 0..diffunit.token_count(base)
+        list.push(at, -1)
+    for p in diffscript.common_subsequence(base.ids, side.ids, o)
+        at[p.0] = p.1
+    at
+
+fn run_merge(var w: MergeWriter, base: diffunit.DiffTokens, ours: diffunit.DiffTokens,
+             theirs: diffunit.DiffTokens, o: DiffMergeOptions)
+    let ma = alignment(base, ours, o.diff)
+    let mb = alignment(base, theirs, o.diff)
+    let nb = diffunit.token_count(base)
+    let no = diffunit.token_count(ours)
+    let nt = diffunit.token_count(theirs)
+    var i = 0
+    var j = 0
+    var k = 0
+    for _ in 0..nb + no + nt + 1
+        let i0 = i
+        let j0 = j
+        for _ in i0..nb
+            if ma[i] != j or mb[i] != k
+                break
+            i = i + 1
+            j = j + 1
+            k = k + 1
+        write_range(w, ours, DiffRange { start: j0, end: j })
+        if i >= nb and j >= no and k >= nt
+            break
+        var i2 = i
+        for _ in i..nb
+            if ma[i2] >= 0 and mb[i2] >= 0
+                break
+            i2 = i2 + 1
+        let j2 = if i2 < nb
+            ma[i2]
+        else
+            no
+        let k2 = if i2 < nb
+            mb[i2]
+        else
+            nt
+        chunk(w, base, ours, theirs, DiffRange { start: i, end: i2 },
+              DiffRange { start: j, end: j2 }, DiffRange { start: k, end: k2 }, o)
+        i = i2
+        j = j2
+        k = k2
+
+// Whether two ranges hold the same tokens.
+fn same(x: diffunit.DiffTokens, rx: diffunit.DiffRange, y: diffunit.DiffTokens,
+        ry: diffunit.DiffRange) -> Bool
+    let n = diffunit.range_len(rx)
+    if n != diffunit.range_len(ry)
+        return false
+    for d in 0..n
+        if x.ids[rx.start + d] != y.ids[ry.start + d]
+            return false
+    true
+
+// One chunk between two stable runs.
+fn chunk(var w: MergeWriter, base: diffunit.DiffTokens, ours: diffunit.DiffTokens,
+         theirs: diffunit.DiffTokens, rb: diffunit.DiffRange, ro: diffunit.DiffRange,
+         rt: diffunit.DiffRange, o: DiffMergeOptions)
+    let ours_same = same(ours, ro, base, rb)
+    let theirs_same = same(theirs, rt, base, rb)
+    if ours_same
+        write_range(w, theirs, rt)
+        w.merged = w.merged + 1
+        return
+    if theirs_same or same(ours, ro, theirs, rt)
+        write_range(w, ours, ro)
+        w.merged = w.merged + 1
+        return
+    var c = DiffConflict { base: rb, ours: ro, theirs: rt, resolved: o.favor != DiffFavorNone }
+    match o.favor
+        DiffFavorOurs   =>
+            write_range(w, ours, ro)
+        DiffFavorTheirs =>
+            write_range(w, theirs, rt)
+        DiffFavorUnion  =>
+            write_range(w, ours, ro)
+            write_range(w, theirs, rt)
+        DiffFavorNone   =>
+            if o.style == DiffMergeZealousDiff3
+                c = zealous(w, ours, theirs, c)
+            write_markers(w, c, base, ours, theirs, o)
+            write_range(w, ours, DiffRange { start: c.ours.end, end: ro.end })
+    list.push(w.conflicts, c)
+
+// Write the tokens both sides of a conflict begin and end with outside
+// it, and answer the narrowed conflict.
+fn zealous(var w: MergeWriter, ours: diffunit.DiffTokens, theirs: diffunit.DiffTokens,
+           c: DiffConflict) -> DiffConflict
+    let lo = diffunit.range_len(c.ours)
+    let lt = diffunit.range_len(c.theirs)
+    let most = if lo < lt
+        lo
+    else
+        lt
+    var head = 0
+    for _ in 0..most
+        if ours.ids[c.ours.start + head] != theirs.ids[c.theirs.start + head]
+            break
+        head = head + 1
+    var tail = 0
+    for _ in 0..most - head
+        if ours.ids[c.ours.end - 1 - tail] != theirs.ids[c.theirs.end - 1 - tail]
+            break
+        tail = tail + 1
+    write_range(w, ours, DiffRange { start: c.ours.start, end: c.ours.start + head })
+    DiffConflict { base: c.base,
+                   ours: DiffRange { start: c.ours.start + head, end: c.ours.end - tail },
+                   theirs: DiffRange { start: c.theirs.start + head, end: c.theirs.end - tail },
+                   resolved: false }
+
+fn write_markers(var w: MergeWriter, c: DiffConflict, base: diffunit.DiffTokens,
+                 ours: diffunit.DiffTokens, theirs: diffunit.DiffTokens, o: DiffMergeOptions)
+    let m = markers(o)
+    write_marker(w, m.0)
+    write_range(w, ours, c.ours)
+    if o.style != DiffMergeTwoSided
+        write_marker(w, m.1)
+        write_range(w, base, c.base)
+    write_marker(w, m.2)
+    write_range(w, theirs, c.theirs)
+    write_marker(w, m.3)
+
+// Whether a conflict marker of `size` begins at `at`.
+fn marker_at(text: Str, at: Int, size: Int) -> Bool
+    let c = str.byte_at_or(text, at, 0)
+    if c != '<' and c != '|' and c != '=' and c != '>'
+        return false
+    for d in 0..size
+        if str.byte_at_or(text, at + d, 0) != c
+            return false
+    let after = str.byte_at_or(text, at + size, 0)
+    after == ' ' or after == '\n' or after == '\r' or after == 0

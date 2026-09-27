@@ -1,64 +1,56 @@
 // diffpatch.nv — a unified diff read back in, and applied.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Parsing answers a `Result`, because a malformed patch has nothing to
+// hand back.  Applying does not.  A patch of five hunks that places
+// three and rejects two has produced a file and a list of rejects, which
+// is what `patch(1)` does, so `DiffApplyResult` carries the text, what
+// each placed hunk cost, and the hunks that did not go in.
+// `rejects_empty` is the check for a caller who wanted all or nothing.
 //
-// **`apply` DOES NOT ANSWER A `Result`, AND THAT IS THE DESIGN.**  A
-// patch of five hunks that places three and rejects two has produced a
-// file and a reject list. That is what `patch(1)` does, it is what
-// every person who has ever run `patch` expects, and it is the only
-// answer a caller can act on: an `Err` throws away the three hunks that
-// went in, and the caller then has to re-implement partial application
-// to get them back. So `DiffApplyResult` carries the text, what
-// happened to every hunk that applied, and the ones that did not —
-// and `rejects_empty` is the one-line check for a caller who wanted
-// all-or-nothing after all.
+// An applier has two separate allowances.  The offset is how far from
+// the line named in the header a hunk may be found; a file that moved is
+// ordinary.  The fuzz is how many context lines at each end of a hunk
+// may be ignored; the code around the change is then different, which
+// is where a wrong application comes from.  `DiffApplyResult` reports
+// both for every hunk.
 //
-// PARSING IS A `Result`, and the asymmetry is the point: a malformed
-// patch is a bug in the bytes, and there is nothing to hand back.
-//
-// FUZZ IS TWO NUMBERS, NOT ONE.  `patch` has an offset — how far from
-// the line the header names it is willing to look — and a fuzz — how
-// many context lines it is willing to drop. They fail differently: an
-// offset means the file moved, which is ordinary; dropping context
-// means the surrounding code changed, which is where a wrong
-// application comes from. A single knob makes the dangerous one
-// invisible, so both are fields and `DiffApplyResult` reports both
-// per hunk.
-//
-// THE SPANS POINT INTO THE PATCH, NOT INTO A COPY OF IT.  A parsed
-// patch holds the patch text and byte spans into it. A `git format-patch`
-// series of a thousand hunks is parsed without copying a line, and a
-// caller that only wants the file names never touches the bodies.
+// A parsed patch holds the patch text and byte spans into it, so a long
+// series is parsed without copying a line.  The rules are GNU patch's
+// ("patch - apply a diff file to an original", sections on offsets and
+// fuzz), and the format is the GNU diffutils manual's unified format.
 
+use std.str
+use std.list
+use std.bytes
 use diffunit
 use diffscript
 
 // What a line in a hunk body is.
 pub enum DiffPatchLineKind
-    // A ` ` line: present on both sides.
+    // A ` ` line: present on both sides.  An empty line inside a hunk is
+    // read as an empty context line, as GNU patch reads it.
     DiffPatchContext
     // A `-` line.
     DiffPatchRemoved
     // A `+` line.
     DiffPatchAdded
-    // A `\ No newline at end of file` line. It qualifies the line
-    // BEFORE it, and it is a kind of its own rather than a flag on
-    // that line because a hunk can carry two of them — one for the
-    // removed side and one for the added side — and a flag cannot
-    // hold both.
+    // A `\ No newline at end of file` line.  It qualifies the line
+    // before it.  It is a kind of its own because a hunk can carry two,
+    // one for the removed side and one for the added side.
     DiffPatchNoNewline
 
 // One line of a hunk body.
 pub struct DiffPatchLine
     kind: DiffPatchLineKind
-    // The line's text WITHOUT its leading marker byte, as a span into
-    // the patch text.
+    // The line's text without its leading marker byte and without its
+    // newline, as a span into the patch text.
     text: diffunit.DiffSpan
 
 // One `@@` hunk.
 pub struct DiffPatchHunk
     // 1-based start line in the left file, and how many lines of it
-    // this hunk covers. Zero and zero for a hunk that only adds.
+    // this hunk covers.  For a hunk that covers no left line, the start
+    // is the line after which the hunk goes, and 0 for the file's start.
     a_start: Int
     a_count: Int
     // The same for the right file.
@@ -71,16 +63,17 @@ pub struct DiffPatchHunk
 
 // One file's worth of a patch: the `---`/`+++` pair and its hunks.
 pub struct DiffFilePatch
-    // The two names as the patch spells them, prefixes and all. NOT
-    // stripped of `a/` and `b/`: how many leading components to strip
-    // is `patch -p<n>`, it is the caller's choice, and a package that
-    // guessed would be wrong for every patch that was not made by git.
+    // The two names as the patch spells them, prefixes included.  How
+    // many leading components to strip is `patch -p<n>`, the caller's
+    // choice, made with `strip_path`.
     a_path: Str
     b_path: Str
     // The timestamps as written, or empty strings.
     a_stamp: Str
     b_stamp: Str
     hunks: [DiffPatchHunk]
+    // The patch text the hunks' spans point into.
+    source: Str
 
 // A whole patch file, which may cover many files.
 pub struct DiffPatch
@@ -88,34 +81,27 @@ pub struct DiffPatch
     source: Str
     files: [DiffFilePatch]
 
-// Why a patch could not be parsed. Every variant carries the 1-based
-// line of the patch it failed on, because a patch is a file somebody
-// will open in an editor.
+// Why a patch could not be parsed.  Every variant but the last carries
+// the 1-based line of the patch it failed on.
 pub enum DiffPatchError
     // A `---` without a `+++` after it, or a `+++` with no `---`.
     DiffPatchBadFileHeader(line: Int)
     // An `@@` line that is not `@@ -l[,s] +l[,s] @@`.
     DiffPatchBadHunkHeader(line: Int)
     // The hunk's body does not contain the number of lines its header
-    // declared. Carries both numbers, because the difference says which
-    // side is wrong.
+    // declared.  Carries both numbers for the side that is short.
     DiffPatchHunkCountMismatch(line: Int, declared: Int, counted: Int)
     // A line inside a hunk whose first byte is none of ` `, `-`, `+`,
     // `\`.
     DiffPatchBadLinePrefix(line: Int)
-    // The patch ends inside a hunk.
+    // The patch ends right after a hunk header, with no body.
     DiffPatchTruncated(line: Int)
     // Nothing in the text looked like a patch at all.
     DiffPatchNotAPatch
 
-// The one-line message, for a caller printing rather than matching.
-//
-// `Result<T, DiffPatchError>` requires it — SPEC § 3.4 makes `Error`
-// the bound on a result's error type — so the impl exists whether or
-// not an interface release has anything to say yet, and its body is a
-// `todo()` like every other body here. The message every variant will
-// carry names the patch line, because a malformed patch is a file
-// somebody is about to open in an editor.
+// The one-line message, for a caller printing rather than matching.  It
+// names the patch line, because a malformed patch is a file somebody is
+// about to open in an editor.
 //
 // ```novo
 // use diffpatch
@@ -125,42 +111,53 @@ pub enum DiffPatchError
 //     Err(e) => println(e.message())
 // ```
 impl Error for DiffPatchError
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("diff-nv.DiffPatchError.message")
+        match self
+            DiffPatchBadFileHeader(l)           =>
+                "line ${l}: a `---` file header without its `+++` line"
+            DiffPatchBadHunkHeader(l)           =>
+                "line ${l}: a hunk header that is not `@@ -l,s +l,s @@`"
+            DiffPatchHunkCountMismatch(l, d, c) =>
+                "line ${l}: the hunk header declares ${d} lines and the body holds ${c}"
+            DiffPatchBadLinePrefix(l)           =>
+                "line ${l}: a hunk line that starts with none of ` `, `-`, `+` or `\\`"
+            DiffPatchTruncated(l)               =>
+                "line ${l}: the patch ends inside a hunk"
+            DiffPatchNotAPatch                  =>
+                "the text holds no `---` and `+++` file header"
 
 // How far an applier may bend.
 pub struct DiffApplyOptions
-    // Context lines a hunk may lose before it is rejected. `patch -F`.
-    // Zero means every context line must match.
+    // Context lines at each end of a hunk that may be ignored before it
+    // is rejected.  `patch -F`.  Zero means every context line must
+    // match.
     fuzz: Int
     // Lines away from the header's position the applier may search.
     // Zero means the hunk must be exactly where it says it is.
     max_offset: Int
     // Apply the patch backwards: `patch -R`.
     reverse: Bool
-    // Compare context and removed lines ignoring horizontal
-    // whitespace. `git apply --ignore-whitespace`.
+    // Compare context and removed lines ignoring horizontal whitespace.
+    // `git apply --ignore-whitespace`.
     ignore_whitespace: Bool
-    // Answer `DiffRejectAlreadyApplied` for a hunk whose ADDED lines
-    // are already present where its removed lines should have been,
-    // instead of `DiffRejectNoMatch`. Off by default because deciding
-    // this costs a second search, and on for an installer that has to
-    // be re-runnable.
+    // Answer `DiffRejectAlreadyApplied` for a hunk whose added lines are
+    // already present where its removed lines should have been, instead
+    // of `DiffRejectNoMatch`.  Off by default because it costs a second
+    // search.
     detect_already_applied: Bool
 
 // Why one hunk did not go in.
 pub enum DiffRejectReason
     // Its context does not occur within `max_offset`, even after
-    // dropping `fuzz` lines.
+    // ignoring `fuzz` lines.
     DiffRejectNoMatch
-    // Its context occurs at more than one place within `max_offset`
-    // and the applier will not guess. Carries both positions, because
-    // a person resolving this needs to see them.
+    // Its context occurs at two places the same distance from the
+    // header's position, and the applier will not guess.  Both are
+    // 1-based lines of the file.
     DiffRejectAmbiguous(at: Int, also_at: Int)
-    // The hunk's effect is already in the file.
+    // The hunk's effect is already in the file, at this 1-based line.
     DiffRejectAlreadyApplied(at: Int)
-    // It would touch lines an earlier hunk already changed. Carries the
+    // It would touch lines an earlier hunk already changed.  Carries the
     // index of that hunk.
     DiffRejectOverlap(with_hunk: Int)
 
@@ -170,35 +167,51 @@ pub struct DiffReject
     hunk: Int
     reason: DiffRejectReason
 
-// What one hunk that DID go in cost.
+// What one hunk that did go in cost.
 pub struct DiffPlacement
     hunk: Int
-    // Lines from where its header said it would be. Negative is
+    // Lines from where its header said it would be.  Negative is
     // earlier.
     offset: Int
-    // Context lines dropped to make it fit. Zero is a clean
-    // application; anything else is the number a person should look
-    // at.
+    // Context lines ignored to make it fit.  Zero is a clean
+    // application.
     fuzz_used: Int
 
 // The result of applying a file patch.
 pub struct DiffApplyResult
-    // The file as it stands after every hunk that applied. The
-    // original text when every hunk was rejected.
+    // The file as it stands after every hunk that applied.  The original
+    // text when every hunk was rejected.
     text: Str
     placed: [DiffPlacement]
     rejects: [DiffReject]
 
-// `patch`'s defaults: no fuzz, an offset search of 20 lines, forwards.
+// `patch`'s behaviour with no options: no fuzz, an offset search of 20
+// lines, forwards.
+//
+// ```novo
+// use diffpatch
+//
+// println(str.from_int(diffpatch.apply_options().max_offset))   // 20
+// ```
 pub fn apply_options() -> DiffApplyOptions []
-    todo("diff-nv.diffpatch.apply_options")
+    DiffApplyOptions { fuzz: 0, max_offset: 20, reverse: false, ignore_whitespace: false,
+                       detect_already_applied: false }
 
-// `git apply`'s defaults: no fuzz and no offset — a hunk is exactly
+// `git apply`'s defaults: no fuzz and no offset.  A hunk is exactly
 // where it says it is or it is rejected.
+//
+// ```novo
+// use diffpatch
+//
+// println(str.from_int(diffpatch.strict_apply_options().max_offset))   // 0
+// ```
 pub fn strict_apply_options() -> DiffApplyOptions []
-    todo("diff-nv.diffpatch.strict_apply_options")
+    DiffApplyOptions { fuzz: 0, max_offset: 0, reverse: false, ignore_whitespace: false,
+                       detect_already_applied: false }
 
-// Parse unified-diff text.
+// Parse unified-diff text.  Lines before, between and after the file
+// patches, such as `diff --git` and `index` lines or a mail's prose, are
+// skipped.
 //
 // ```novo
 // use diffpatch
@@ -209,14 +222,63 @@ pub fn strict_apply_options() -> DiffApplyOptions []
 //     Err(_) => println("not a patch")
 // ```
 pub fn parse_unified(text: Str) -> Result<DiffPatch, DiffPatchError> []
-    todo("diff-nv.diffpatch.parse_unified")
+    let ls = line_table(text)
+    let n = list.len(ls)
+    var files: [DiffFilePatch] = []
+    var i = 0
+    for _ in 0..n
+        if i >= n
+            break
+        let line = line_str(text, ls[i])
+        if str.starts_with(line, "+++ ")
+            return Err(DiffPatchBadFileHeader(i + 1))
+        if not str.starts_with(line, "--- ")
+            i = i + 1
+            continue
+        if i + 1 >= n or not str.starts_with(line_str(text, ls[i + 1]), "+++ ")
+            return Err(DiffPatchBadFileHeader(i + 1))
+        let a = name_and_stamp(str.slice(line, 4, str.len(line)))
+        let b_line = line_str(text, ls[i + 1])
+        let b = name_and_stamp(str.slice(b_line, 4, str.len(b_line)))
+        i = i + 2
+        var hunks: [DiffPatchHunk] = []
+        var cur = LineCursor { at: i }
+        for _ in 0..n
+            if cur.at >= n or not str.starts_with(line_str(text, ls[cur.at]), "@@")
+                break
+            list.push(hunks, parse_hunk(text, ls, cur)!)
+        i = cur.at
+        list.push(files, DiffFilePatch { a_path: a.0, b_path: b.0, a_stamp: a.1, b_stamp: b.1,
+                                         hunks: hunks, source: text })
+    if list.len(files) == 0
+        return Err(DiffPatchNotAPatch)
+    Ok(DiffPatch { source: text, files: files })
 
 // The 1-based patch line a parse error was found on, for a caller
-// reporting it without matching on every variant.
+// reporting it without matching on every variant.  0 for
+// `DiffPatchNotAPatch`, which has no line.
+//
+// ```novo
+// use diffpatch
+//
+// println(str.from_int(diffpatch.error_line(DiffPatchBadHunkHeader(7))))   // 7
+// ```
 pub fn error_line(e: DiffPatchError) -> Int []
-    todo("diff-nv.diffpatch.error_line")
+    match e
+        DiffPatchBadFileHeader(l)           => l
+        DiffPatchBadHunkHeader(l)           => l
+        DiffPatchHunkCountMismatch(l, _, _) => l
+        DiffPatchBadLinePrefix(l)           => l
+        DiffPatchTruncated(l)               => l
+        DiffPatchNotAPatch                  => 0
 
 // Apply one file's hunks to that file's text.
+//
+// Each hunk is looked for at the line its header names, moved by what
+// the earlier hunks added or removed and by the offset the previous hunk
+// was found at.  The search goes outwards one line at a time up to
+// `max_offset`, then again with one more context line ignored at each
+// end, up to `fuzz`.
 //
 // ```novo
 // use diffpatch
@@ -229,51 +291,544 @@ pub fn error_line(e: DiffPatchError) -> Int []
 //         println(if diffpatch.rejects_empty(r) then "clean" else "rejected")
 // ```
 pub fn apply(text: Str, fp: DiffFilePatch, o: DiffApplyOptions) -> DiffApplyResult []
-    todo("diff-nv.diffpatch.apply")
+    var work = file_lines(text)
+    var placed: [DiffPlacement] = []
+    var rejects: [DiffReject] = []
+    var delta = 0
+    var last_offset = 0
+    var floor = 0
+    var last_hunk = -1
+    for hi in 0..list.len(fp.hunks)
+        let h = fp.hunks[hi]
+        let sides = hunk_sides(fp, h, o.reverse)
+        let start = if o.reverse
+            h.b_start
+        else
+            h.a_start
+        let count = if o.reverse
+            h.b_count
+        else
+            h.a_count
+        let pos = (if count == 0 then start else start - 1) + delta + last_offset
+        let found = place(work, sides, pos, o)
+        if found.0 == 1 and found.1 < floor
+            list.push(rejects, DiffReject { hunk: hi, reason: DiffRejectOverlap(last_hunk) })
+        elif found.0 == 1
+            let old = found.3
+            let new = found.4
+            let at = found.1
+            let before = work[0:at]
+            let after = work[at + list.len(old):list.len(work)]
+            work = list.concat(list.concat(before, new), after)
+            let offset = at - found.5
+            list.push(placed, DiffPlacement { hunk: hi, offset: offset, fuzz_used: found.2 })
+            delta = delta + list.len(new) - list.len(old)
+            last_offset = offset
+            floor = at + list.len(new)
+            last_hunk = hi
+        elif found.0 == 2
+            list.push(rejects, DiffReject { hunk: hi,
+                                            reason: DiffRejectAmbiguous(found.1 + 1, found.2 + 1) })
+        else
+            list.push(rejects, DiffReject { hunk: hi, reason: not_placed(work, sides, pos, o) })
+    DiffApplyResult { text: str.join(work, ""), placed: placed, rejects: rejects }
 
 // Apply, appending the result to the caller's buffer instead of
-// allocating a string. The rejects come back beside it because they
-// are not bytes.
-pub fn apply_into(out: [u8], text: Str, fp: DiffFilePatch,
-                  o: DiffApplyOptions) -> ([u8], [DiffReject]) []
-    todo("diff-nv.diffpatch.apply_into")
-
-// Whether every hunk applied — the check a caller who wanted
-// all-or-nothing makes, before deciding to keep the text or throw it
-// away.
-pub fn rejects_empty(r: DiffApplyResult) -> Bool []
-    todo("diff-nv.diffpatch.rejects_empty")
-
-// Append a `.rej` file's contents to `out`: the rejected hunks, in
-// unified form, exactly as `patch` writes them, so the file a person
-// finds beside their source is the file they expect.
-pub fn reject_file_into(out: [u8], p: DiffPatch, fp: DiffFilePatch, rs: [DiffReject]) -> [u8] []
-    todo("diff-nv.diffpatch.reject_file_into")
-
-// A parsed file patch as an edit script, so everything in
-// `diffscript` and `diffrender` works on a patch that came off disk —
-// counting it, inverting it, rendering it side by side.
+// allocating a string.  The rejects come back beside it.
 //
-// The ranges are token ranges over the patch's own line numbering,
-// which is what makes this exact: a patch names line numbers and this
-// package's ranges are line indices, so the conversion is a
-// subtraction rather than a re-diff.
-pub fn script_of(fp: DiffFilePatch) -> diffscript.DiffScript []
-    todo("diff-nv.diffpatch.script_of")
+// ```novo
+// use diffpatch
+//
+// match diffpatch.parse_unified("--- a\n+++ b\n@@ -1 +1 @@\n-one\n+two\n")
+//     Err(_) => println("not a patch")
+//     Ok(p)  =>
+//         var buf: [u8] = []
+//         let r = diffpatch.apply_into(buf, "one\n", p.files[0], diffpatch.apply_options())
+//         print(bytes.byte_list_to_str(r.0))   // two
+// ```
+pub fn apply_into(var out: [u8], text: Str, fp: DiffFilePatch,
+                  o: DiffApplyOptions) -> ([u8], [DiffReject]) []
+    let r = apply(text, fp, o)
+    list.append(out, bytes.to_byte_list(bytes.from_str(r.text)))
+    (out, r.rejects[:])
 
-// Render an edit script back out as a file patch value, so a caller can
-// write a patch it computed with `reject_file_into`, or round-trip one.
+// Whether every hunk applied: the check a caller who wanted all or
+// nothing makes before deciding to keep the text.
+//
+// ```novo
+// use diffpatch
+//
+// let r = DiffApplyResult { text: "", placed: [], rejects: [] }
+// println(if diffpatch.rejects_empty(r) then "clean" else "rejected")   // clean
+// ```
+pub fn rejects_empty(r: DiffApplyResult) -> Bool []
+    list.len(r.rejects) == 0
+
+// Append a `.rej` file's contents to `out`: the file header and the
+// rejected hunks, in unified form as `patch` writes them.
+//
+// ```novo
+// use diffpatch
+//
+// match diffpatch.parse_unified("--- a\n+++ b\n@@ -1 +1 @@\n-one\n+two\n")
+//     Err(_) => println("not a patch")
+//     Ok(p)  =>
+//         let r = diffpatch.apply("zero\n", p.files[0], diffpatch.strict_apply_options())
+//         var buf: [u8] = []
+//         diffpatch.reject_file_into(buf, p, p.files[0], r.rejects)
+//         print(bytes.byte_list_to_str(buf))
+// ```
+pub fn reject_file_into(var out: [u8], p: DiffPatch, fp: DiffFilePatch, rs: [DiffReject]) -> [u8] []
+    if list.len(rs) == 0
+        return out
+    var parts: [Str] = []
+    list.push(parts, "--- " + stamped(fp.a_path, fp.a_stamp) + "\n")
+    list.push(parts, "+++ " + stamped(fp.b_path, fp.b_stamp) + "\n")
+    for r in rs
+        if r.hunk < 0 or r.hunk >= list.len(fp.hunks)
+            continue
+        let h = fp.hunks[r.hunk]
+        var header = "@@ -" + header_range(h.a_start, h.a_count) + " +"
+                     + header_range(h.b_start, h.b_count) + " @@"
+        if h.section.end > h.section.start
+            header = header + " " + str.slice(fp.source, h.section.start, h.section.end)
+        list.push(parts, header + "\n")
+        for l in h.lines
+            let body = str.slice(fp.source, l.text.start, l.text.end)
+            match l.kind
+                DiffPatchContext   => list.push(parts, " " + body + "\n")
+                DiffPatchRemoved   => list.push(parts, "-" + body + "\n")
+                DiffPatchAdded     => list.push(parts, "+" + body + "\n")
+                DiffPatchNoNewline => list.push(parts, "\\ No newline at end of file\n")
+    list.append(out, bytes.to_byte_list(bytes.from_str(str.join(parts, ""))))
+    out
+
+// A parsed file patch as an edit script, so everything in `diffscript`
+// and `diffrender` works on a patch that came off disk.
+//
+// The ranges are line indices over the patch's own line numbering, from
+// the first line of the file to the last line the patch covers.  The
+// lines between hunks are equal.  The script records `minimal` as false,
+// because nothing is known about how the patch was made.
+//
+// ```novo
+// use diffpatch
+// use diffscript
+//
+// match diffpatch.parse_unified("--- a\n+++ b\n@@ -2 +2 @@\n-one\n+two\n")
+//     Err(_) => println("not a patch")
+//     Ok(p)  =>
+//         let c = diffscript.counts(diffpatch.script_of(p.files[0]))
+//         println("${c.0} ${c.1}")   // 1 1
+// ```
+pub fn script_of(fp: DiffFilePatch) -> diffscript.DiffScript []
+    var blocks: [(Int, Int, Int)] = []
+    var ai = 0
+    var bi = 0
+    for h in fp.hunks
+        let ha = if h.a_count == 0
+            h.a_start
+        else
+            h.a_start - 1
+        let hb = if h.b_count == 0
+            h.b_start
+        else
+            h.b_start - 1
+        let gap = diffscript.min_int(ha - ai, hb - bi)
+        if gap > 0
+            list.push(blocks, (ai, bi, gap))
+        if ha > ai
+            ai = ha
+        if hb > bi
+            bi = hb
+        for l in h.lines
+            match l.kind
+                DiffPatchContext   =>
+                    list.push(blocks, (ai, bi, 1))
+                    ai = ai + 1
+                    bi = bi + 1
+                DiffPatchRemoved   =>
+                    ai = ai + 1
+                DiffPatchAdded     =>
+                    bi = bi + 1
+                DiffPatchNoNewline =>
+                    pass
+    DiffScript { ops: diffscript.ops_of(diffscript.joined(blocks), ai, bi), algo: DiffMyers,
+                 minimal: false, steps: 0 }
+
+// An edit script as a file patch value: the hunks `diffscript.hunks`
+// groups with `context` lines around each change, over a patch text this
+// function writes.  Apply it, write it out with `reject_file_into`, or
+// turn it back into a script.
+//
+// ```novo
+// use diffunit
+// use diffscript
+// use diffpatch
+//
+// let input = diffunit.tokenize("one\ntwo\n", "one\nTWO\n", DiffLines)
+// let s = diffscript.diff(input, diffscript.minimal_options())
+// let fp = diffpatch.patch_of(input, s, "a/f", "b/f", 3)
+// println(str.from_int(list.len(fp.hunks)))   // 1
+// ```
 pub fn patch_of(input: diffunit.DiffInput, s: diffscript.DiffScript, a_path: Str, b_path: Str,
                 context: Int) -> DiffFilePatch []
-    todo("diff-nv.diffpatch.patch_of")
+    var w = SourceWriter { parts: [], at: 0 }
+    write_text(w, "--- " + a_path + "\n+++ " + b_path + "\n")
+    var hunks: [DiffPatchHunk] = []
+    for h in diffscript.hunks(s, context)
+        let la = diffunit.range_len(h.a)
+        let lb = diffunit.range_len(h.b)
+        let header = "@@ -" + header_range((if la == 0 then h.a.start else h.a.start + 1), la)
+                     + " +" + header_range((if lb == 0 then h.b.start else h.b.start + 1), lb) + " @@\n"
+        write_text(w, header)
+        var lines: [DiffPatchLine] = []
+        for op in h.ops
+            match op
+                DiffEqual(a, _)   => write_lines(w, lines, " ", DiffPatchContext, input.a, a)
+                DiffDelete(a, _)  => write_lines(w, lines, "-", DiffPatchRemoved, input.a, a)
+                DiffInsert(_, b)  => write_lines(w, lines, "+", DiffPatchAdded, input.b, b)
+                DiffReplace(a, b) =>
+                    write_lines(w, lines, "-", DiffPatchRemoved, input.a, a)
+                    write_lines(w, lines, "+", DiffPatchAdded, input.b, b)
+        list.push(hunks, DiffPatchHunk { a_start: (if la == 0 then h.a.start else h.a.start + 1),
+                                         a_count: la,
+                                         b_start: (if lb == 0 then h.b.start else h.b.start + 1),
+                                         b_count: lb,
+                                         section: DiffSpan { start: 0, end: 0 },
+                                         lines: lines })
+    DiffFilePatch { a_path: a_path, b_path: b_path, a_stamp: "", b_stamp: "", hunks: hunks,
+                    source: str.join(w.parts, "") }
 
-// Strip `n` leading path components from a name, as `patch -p<n>`
-// does — including its rule that `/dev/null` is never stripped and
-// means the file is created or deleted.
+// Strip `n` leading path components from a name, as `patch -p<n>` does.
+// `/dev/null` is never stripped.  A name with fewer components than `n`
+// keeps its last one.
+//
+// ```novo
+// use diffpatch
+//
+// println(diffpatch.strip_path("a/src/main.nv", 1))   // src/main.nv
+// ```
 pub fn strip_path(name: Str, n: Int) -> Str []
-    todo("diff-nv.diffpatch.strip_path")
+    if name == "/dev/null"
+        return name
+    var rest = name
+    for _ in 0..n
+        match str.index(rest, "/")
+            Some(k) =>
+                rest = str.slice(rest, k + 1, str.len(rest))
+            None    =>
+                break
+    rest
 
-// Whether a file patch creates the file (`--- /dev/null`) or deletes
-// it (`+++ /dev/null`), as `(creates, deletes)`.
+// Whether a file patch creates the file (`--- /dev/null`) or deletes it
+// (`+++ /dev/null`), as `(creates, deletes)`.
+//
+// ```novo
+// use diffpatch
+//
+// match diffpatch.parse_unified("--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hi\n")
+//     Err(_) => println("not a patch")
+//     Ok(p)  => println(if diffpatch.file_mode(p.files[0]).0 then "creates" else "edits")
+// ```
 pub fn file_mode(fp: DiffFilePatch) -> (Bool, Bool) []
-    todo("diff-nv.diffpatch.file_mode")
+    (fp.a_path == "/dev/null", fp.b_path == "/dev/null")
+
+// ── Parsing ───────────────────────────────────────────────────────────
+
+// Every line of `text` as `(start, end)`, the end before the newline.
+fn line_table(text: Str) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    let n = str.len(text)
+    var start = 0
+    for i in 0..n
+        if str.byte_at_or(text, i, 0) == '\n'
+            list.push(out, (start, i))
+            start = i + 1
+    if start < n
+        list.push(out, (start, n))
+    out
+
+fn line_str(text: Str, l: (Int, Int)) -> Str
+    str.slice(text, l.0, l.1)
+
+// A header's name and stamp, which a tab separates.
+fn name_and_stamp(rest: Str) -> (Str, Str)
+    match str.index(rest, "\t")
+        Some(k) => (str.slice(rest, 0, k), str.slice(rest, k + 1, str.len(rest)))
+        None    => (rest, "")
+
+// The line a parse has reached.
+struct LineCursor
+    var at: Int
+
+// The hunk whose header is the cursor's line.  The cursor moves to the
+// line after the hunk.
+fn parse_hunk(text: Str, ls: [(Int, Int)],
+              var cur: LineCursor) -> Result<DiffPatchHunk, DiffPatchError>
+    let n = list.len(ls)
+    let i = cur.at
+    let hl = ls[i]
+    let nums = hunk_numbers(text, hl.0, hl.1)
+    if nums.0 < 0
+        return Err(DiffPatchBadHunkHeader(i + 1))
+    let a_count = nums.1
+    let b_count = nums.3
+    var lines: [DiffPatchLine] = []
+    var ra = 0
+    var rb = 0
+    var j = i + 1
+    for _ in 0..n
+        if ra >= a_count and rb >= b_count
+            if j < n and str.byte_at_or(text, ls[j].0, 0) == '\\'
+                list.push(lines, DiffPatchLine { kind: DiffPatchNoNewline,
+                                                 text: DiffSpan { start: ls[j].1, end: ls[j].1 } })
+                j = j + 1
+            break
+        if j >= n
+            if j == i + 1
+                return Err(DiffPatchTruncated(i + 1))
+            return Err(short_hunk(j, a_count, ra, b_count, rb))
+        let l = ls[j]
+        let body = DiffSpan { start: (if l.1 > l.0 then l.0 + 1 else l.0), end: l.1 }
+        let c = if l.1 > l.0
+            str.byte_at_or(text, l.0, 0)
+        else
+            ' '
+        if c == ' '
+            list.push(lines, DiffPatchLine { kind: DiffPatchContext, text: body })
+            ra = ra + 1
+            rb = rb + 1
+        elif c == '-' and ra < a_count
+            list.push(lines, DiffPatchLine { kind: DiffPatchRemoved, text: body })
+            ra = ra + 1
+        elif c == '+' and rb < b_count
+            list.push(lines, DiffPatchLine { kind: DiffPatchAdded, text: body })
+            rb = rb + 1
+        elif c == '\\'
+            list.push(lines, DiffPatchLine { kind: DiffPatchNoNewline, text: body })
+        elif c == '-' or c == '+' or c == '@'
+            return Err(short_hunk(j + 1, a_count, ra, b_count, rb))
+        else
+            return Err(DiffPatchBadLinePrefix(j + 1))
+        j = j + 1
+    cur.at = j
+    Ok(DiffPatchHunk { a_start: nums.0, a_count: a_count, b_start: nums.2,
+                       b_count: b_count, section: nums.4, lines: lines })
+
+fn short_hunk(line: Int, a_count: Int, ra: Int, b_count: Int, rb: Int) -> DiffPatchError
+    if ra < a_count
+        DiffPatchHunkCountMismatch(line, a_count, ra)
+    else
+        DiffPatchHunkCountMismatch(line, b_count, rb)
+
+// The four numbers of `@@ -l[,s] +l[,s] @@` and the section's span, or
+// a start of -1 when the line is not a hunk header.
+fn hunk_numbers(text: Str, start: Int, end: Int) -> (Int, Int, Int, Int, diffunit.DiffSpan)
+    let bad = (-1, 0, 0, 0, DiffSpan { start: end, end: end })
+    if not starts_at(text, start, end, "@@ -")
+        return bad
+    let a = range_at(text, start + 4, end)
+    if a.0 < 0 or not starts_at(text, a.2, end, " +")
+        return bad
+    let b = range_at(text, a.2 + 2, end)
+    if b.0 < 0 or not starts_at(text, b.2, end, " @@")
+        return bad
+    var sec = b.2 + 3
+    if sec < end and str.byte_at_or(text, sec, 0) == ' '
+        sec = sec + 1
+    (a.0, a.1, b.0, b.1, DiffSpan { start: sec, end: end })
+
+fn starts_at(text: Str, at: Int, end: Int, prefix: Str) -> Bool
+    at + str.len(prefix) <= end and str.slice(text, at, at + str.len(prefix)) == prefix
+
+// `l[,s]` at `at`, as `(l, s, next)`; `s` is 1 when it is left out, and
+// `l` is -1 when there is no number.
+fn range_at(text: Str, at: Int, end: Int) -> (Int, Int, Int)
+    let first = number_at(text, at, end)
+    if first.1 == at
+        return (-1, 0, at)
+    if first.1 < end and str.byte_at_or(text, first.1, 0) == ','
+        let second = number_at(text, first.1 + 1, end)
+        if second.1 == first.1 + 1
+            return (-1, 0, at)
+        return (first.0, second.0, second.1)
+    (first.0, 1, first.1)
+
+fn number_at(text: Str, at: Int, end: Int) -> (Int, Int)
+    var v = 0
+    var i = at
+    for _ in at..end
+        let c = str.byte_at_or(text, i, 0)
+        if c < '0' or c > '9'
+            break
+        v = v * 10 + (c - '0')
+        i = i + 1
+    (v, i)
+
+// ── Applying ──────────────────────────────────────────────────────────
+
+// The lines of a file, each with its terminator.
+fn file_lines(text: Str) -> [Str]
+    let t = diffunit.tokenize_one(text, DiffLines, diffunit.exact_policy())
+    var out: [Str] = []
+    for i in 0..diffunit.token_count(t)
+        list.push(out, diffunit.token_str(t, i))
+    out
+
+// A hunk as the lines it expects and the lines it writes, each with the
+// newline it has in the file, and how many context lines lead and trail
+// it: `(old, new, lead, trail)`.
+fn hunk_sides(fp: DiffFilePatch, h: DiffPatchHunk, reverse: Bool) -> ([Str], [Str], Int, Int)
+    var old: [Str] = []
+    var new: [Str] = []
+    var last_kind = DiffPatchNoNewline
+    var lead = 0
+    var trail = 0
+    var in_lead = true
+    for l in h.lines
+        let text = str.slice(fp.source, l.text.start, l.text.end) + "\n"
+        match l.kind
+            DiffPatchContext   =>
+                list.push(old, text)
+                list.push(new, text)
+                if in_lead
+                    lead = lead + 1
+                trail = trail + 1
+            DiffPatchRemoved   =>
+                list.push(old, text)
+                in_lead = false
+                trail = 0
+            DiffPatchAdded     =>
+                list.push(new, text)
+                in_lead = false
+                trail = 0
+            DiffPatchNoNewline =>
+                if last_kind != DiffPatchAdded
+                    unterminate(old)
+                if last_kind != DiffPatchRemoved
+                    unterminate(new)
+        if l.kind != DiffPatchNoNewline
+            last_kind = l.kind
+    if in_lead
+        trail = 0
+    if reverse
+        (new, old, lead, trail)
+    else
+        (old, new, lead, trail)
+
+// Take the newline off the last line of `xs`.
+fn unterminate(var xs: [Str])
+    let n = list.len(xs)
+    if n > 0 and str.ends_with(xs[n - 1], "\n")
+        xs[n - 1] = str.slice(xs[n - 1], 0, str.len(xs[n - 1]) - 1)
+
+// Where the hunk goes, trying each fuzz level in turn: `(status, at,
+// fuzz or other position, old, new, expected)`.  Status 1 is placed at
+// `at` with that fuzz, 2 is ambiguous between `at` and the fourth
+// member's position, and 0 is not found.
+fn place(work: [Str], sides: ([Str], [Str], Int, Int), pos: Int,
+         o: DiffApplyOptions) -> (Int, Int, Int, [Str], [Str], Int)
+    let old = sides.0
+    let new = sides.1
+    var prev = -1
+    for f in 0..o.fuzz + 1
+        let dl = diffscript.min_int(f, sides.2)
+        let dt = diffscript.min_int(f, sides.3)
+        if dl + dt == prev
+            break
+        prev = dl + dt
+        let old_f = old[dl:list.len(old) - dt]
+        let new_f = new[dl:list.len(new) - dt]
+        let found = search(work, old_f, pos + dl, o.max_offset, o.ignore_whitespace)
+        if found.0 == 1
+            return (1, found.1, diffscript.max_int(dl, dt), old_f, new_f, pos + dl)
+        if found.0 == 2
+            return (2, found.1, found.2, old_f, new_f, pos + dl)
+    (0, 0, 0, [], [], pos)
+
+// The nearest position within `max_offset` of `at` where `want` occurs
+// in `work`: `(1, where, 0)`, `(2, one, other)` when two positions are
+// equally near, or `(0, 0, 0)`.
+fn search(work: [Str], want: [Str], at: Int, max_offset: Int, loose: Bool) -> (Int, Int, Int)
+    for d in 0..max_offset + 1
+        let up = fits(work, want, at + d, loose)
+        let down = d > 0 and fits(work, want, at - d, loose)
+        if up and down
+            return (2, at - d, at + d)
+        if up
+            return (1, at + d, 0)
+        if down
+            return (1, at - d, 0)
+    (0, 0, 0)
+
+fn fits(work: [Str], want: [Str], at: Int, loose: Bool) -> Bool
+    if at < 0 or at + list.len(want) > list.len(work)
+        return false
+    for k in 0..list.len(want)
+        if not same_line(work[at + k], want[k], loose)
+            return false
+    true
+
+fn same_line(x: Str, y: Str, loose: Bool) -> Bool
+    if x == y
+        return true
+    loose and squeezed(x) == squeezed(y)
+
+// A line with its horizontal whitespace taken out.
+fn squeezed(s: Str) -> Str
+    var parts: [Str] = []
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if not diffunit.is_hspace(b)
+            list.push(parts, str.from_byte(b))
+    str.join(parts, "")
+
+// Why a hunk that could not be placed was rejected.
+fn not_placed(work: [Str], sides: ([Str], [Str], Int, Int), pos: Int,
+              o: DiffApplyOptions) -> DiffRejectReason
+    if o.detect_already_applied
+        let found = search(work, sides.1, pos, o.max_offset, o.ignore_whitespace)
+        if found.0 == 1
+            return DiffRejectAlreadyApplied(found.1 + 1)
+    DiffRejectNoMatch
+
+// ── Writing ───────────────────────────────────────────────────────────
+
+fn stamped(name: Str, stamp: Str) -> Str
+    if stamp == ""
+        name
+    else
+        name + "\t" + stamp
+
+fn header_range(start: Int, count: Int) -> Str
+    if count == 1
+        str.from_int(start)
+    else
+        str.from_int(start) + "," + str.from_int(count)
+
+// A patch text being written, and the byte offset its next part starts
+// at.
+struct SourceWriter
+    var parts: [Str]
+    var at: Int
+
+fn write_text(var w: SourceWriter, s: Str)
+    list.push(w.parts, s)
+    w.at = w.at + str.len(s)
+
+// Write every token of `r` as a patch line, recording each line's span.
+fn write_lines(var w: SourceWriter, var lines: [DiffPatchLine], mark: Str, kind: DiffPatchLineKind,
+               t: diffunit.DiffTokens, r: diffunit.DiffRange)
+    for i in r.start..r.end
+        var text = diffunit.token_str(t, i)
+        if str.ends_with(text, "\n")
+            text = str.slice(text, 0, str.len(text) - 1)
+        let start = w.at + 1
+        list.push(lines, DiffPatchLine { kind: kind,
+                                         text: DiffSpan { start: start, end: start + str.len(text) } })
+        write_text(w, mark + text + "\n")
+        if diffunit.token_unterminated(t, i)
+            list.push(lines, DiffPatchLine { kind: DiffPatchNoNewline,
+                                             text: DiffSpan { start: w.at, end: w.at } })
+            write_text(w, "\\ No newline at end of file\n")

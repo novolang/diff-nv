@@ -1,91 +1,84 @@
 // diffscript.nv — the edit script, and the three ways of finding one.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// **THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `DiffOp`**, and the
-// load-bearing fact about it is that its four variants carry token
-// RANGES and no text at all.
+// An edit script is a list of `DiffOp` values, and each operation
+// carries token ranges and no text:
 //
 //   DiffEqual(a, b)     the same tokens, at both positions
-//   DiffDelete(a)       tokens in a that are not in b
-//   DiffInsert(b)       tokens in b that are not in a
+//   DiffDelete(a, b)    tokens in a that are not in b; b is empty
+//   DiffInsert(a, b)    tokens in b that are not in a; a is empty
 //   DiffReplace(a, b)   a run of each, paired
 //
-// Everything else in this package is a reader of that list. Unified
-// rendering walks it; side-by-side rendering walks it; a patch parsed
-// off disk is turned into one; a three-way merge is two of them
-// compared. A consumer that wants none of those — snapshot-nv deciding
-// whether a snapshot changed, `novo fmt --check` deciding whether a
-// file is formatted, an editor painting a gutter — reads the list and
-// never renders anything.
+// Everything else in the package reads this list.  Unified rendering
+// walks it, a parsed patch is turned into one, and a three-way merge
+// compares two of them.  A consumer that only asks whether two texts
+// differ reads the list and renders nothing.
 //
-// WHY `DiffReplace` EXISTS AT ALL.  A minimal edit script needs only
-// delete and insert; a replace is a delete adjacent to an insert.  It
-// is here because every consumer re-derives it and the derivations
-// disagree: a renderer pairs them to show `-`/`+` side by side, a
-// merger pairs them to decide whether two edits overlap, and a
-// refinement pairs them to run a word diff inside them.  Pairing them
-// once, in the algorithm that already knows where the runs are, is the
-// difference between one rule and four.  `similar`'s `DiffOp` made the
-// same call, and `difflib`'s opcodes did before it.
+// A replace is a deletion next to an insertion.  It is an operation of
+// its own because a renderer, a merger and an inline refinement all
+// pair the two, and pairing them once, in the walk that already knows
+// where the runs are, keeps the rule in one place.  Rust's `similar`
+// and Python's `difflib` make the same choice.
 //
-// WHY A SCRIPT IS NOT JUST `[DiffOp]`.  `DiffScript` carries which
-// algorithm produced it and whether the answer is MINIMAL.  Myers'
-// O(ND) is quadratic in the worst case, so every real implementation
-// bounds the search and falls back to a coarse script when the bound
-// is hit — `similar` calls it a deadline, git calls it
-// `--no-minimal`. A caller that is showing a person a diff does not
-// care; a caller that is asserting two files are identical, or
-// applying the script as a patch, very much does, and an API that
-// hides the degradation makes that caller unable to ask.
+// A `DiffScript` also records which walk produced it and whether the
+// answer is minimal.  Myers' algorithm is quadratic in the worst case,
+// so the walk is bounded by a count of steps, and a walk that reaches
+// the bound answers a correct script that is not the shortest one.
+//
+// The three walks share one frame.  Each region of the two inputs first
+// loses its common prefix and suffix.  Myers then walks the edit graph
+// (Myers 1986, section 2).  Patience matches the tokens that occur
+// exactly once on each side, keeps the longest increasing run of them,
+// and recurses between them.  Histogram (JGit) matches the region
+// around the rarest common token and recurses on each side of it.
+// Patience and histogram fall back to Myers on a region with no anchor.
 
+use std.list
 use diffunit
 
-// Which walk to take. All three answer a correct edit script; they
+// Which walk to take.  All three answer a correct edit script; they
 // differ in which correct script they answer.
 pub enum DiffAlgo
-    // Myers' O(ND) greedy walk (Myers 1986). The shortest edit script,
-    // subject to the step bound. The default, and what `diff` does.
+    // Myers' O(ND) greedy walk (Myers 1986).  The shortest edit script,
+    // subject to the step bound.  The default, and what `diff` does.
     DiffMyers
     // Bram Cohen's patience diff: match the tokens that occur exactly
-    // once on each side, in order, and recurse between them. Slower,
-    // and much better on source code that moved — a block of braces
-    // matched by Myers because braces are identical is matched here by
-    // the unique line above it.
+    // once on each side, in order, and recurse between them.  Better on
+    // source code that moved, where Myers matches identical closing
+    // braces and patience matches the unique line above them.
     DiffPatience
     // JGit's histogram diff: patience, with the rarest common token
-    // used as the split point when no token is unique. What git uses
-    // when asked, and the best default for code.
+    // used as the split point when no token is unique.  What
+    // `git diff --histogram` does.
     DiffHistogram
 
 // How the walk is bounded and which walk it is.
 pub struct DiffOptions
     algo: DiffAlgo
-    // The most edit-graph steps the search may take before it gives up
-    // on minimality and answers a coarse script. Zero means unbounded,
-    // which is the right setting for a test and the wrong one for an
-    // editor. Counted in steps rather than in milliseconds because a
-    // `core` package has no clock, and because a step bound is
-    // reproducible and a time bound is not — the same two files must
-    // produce the same diff on every machine, or a snapshot test is a
-    // coin toss.
+    // The most edit-graph steps the Myers walk may take before it gives
+    // up on minimality.  Zero means unbounded.  Counted in steps rather
+    // than in time, so the same two inputs produce the same diff on
+    // every machine.  A walk that reaches the bound finishes with the
+    // histogram walk, which needs no steps, and reports the script as
+    // not minimal.
     max_steps: Int
-    // Histogram only: a token occurring more often than this on either
-    // side is not considered as a split point. JGit's default is 64.
+    // Histogram only: a token occurring more often than this in the left
+    // region is not considered as a split point.  JGit's default is 64.
     max_chain: Int
 
-// One edit operation over token ranges. See the module comment: this
-// is the package's load-bearing interface.
+// One edit operation over token ranges.
 pub enum DiffOp
-    // The tokens `a` and `b` are equal. Both ranges have the same
+    // The tokens `a` and `b` are equal.  Both ranges have the same
     // length; both are carried because the two sides are at different
-    // offsets and every consumer needs both.
+    // offsets.
     DiffEqual(a: diffunit.DiffRange, b: diffunit.DiffRange)
-    // The tokens in `a` are in the left input and not the right.
-    DiffDelete(a: diffunit.DiffRange)
-    // The tokens in `b` are in the right input and not the left.
-    DiffInsert(b: diffunit.DiffRange)
-    // A deletion and an insertion at the same place. The two ranges
+    // The tokens in `a` are in the left input and not the right.  `b`
+    // is the empty range where they would have been on the right, so
+    // every operation has a position on both sides.
+    DiffDelete(a: diffunit.DiffRange, b: diffunit.DiffRange)
+    // The tokens in `b` are in the right input and not the left.  `a`
+    // is the empty range on the left where they are inserted.
+    DiffInsert(a: diffunit.DiffRange, b: diffunit.DiffRange)
+    // A deletion and an insertion at the same place.  The two ranges
     // need not be the same length.
     DiffReplace(a: diffunit.DiffRange, b: diffunit.DiffRange)
 
@@ -93,22 +86,22 @@ pub enum DiffOp
 pub struct DiffScript
     // The operations, in order, covering both inputs completely: the
     // `a` ranges tile the left input and the `b` ranges tile the right,
-    // with no gap and no overlap. A consumer may rely on that.
+    // with no gap and no overlap.  No two neighbouring operations are
+    // both equal, and a deletion is never next to an insertion, because
+    // the pair is a replace.
     ops: [DiffOp]
     algo: DiffAlgo
     // False when `max_steps` cut the search short and the script is
-    // correct but not minimal. See the module comment.
+    // correct but not minimal.
     minimal: Bool
-    // Edit-graph steps actually taken, so a caller tuning `max_steps`
-    // has a number to tune against.
+    // Edit-graph steps the Myers walk took, so a caller tuning
+    // `max_steps` has a number to tune against.
     steps: Int
 
-// A run of changes with `context` unchanged tokens on each side of it,
-// and the tokens that separate it from the next run.
+// A run of changes with `context` unchanged tokens on each side of it.
 //
-// This is what a `@@` header names, and a hunk is a value here rather
-// than a formatting concern because a patch applier needs one too, and
-// because an editor showing "3 changed regions" is counting these.
+// This is what a `@@` header names.  A patch applier needs one too, and
+// an editor showing "3 changed regions" is counting these.
 pub struct DiffHunk
     // The token range this hunk covers in the left input, context
     // included.
@@ -118,7 +111,7 @@ pub struct DiffHunk
     // The operations inside it, clipped to the ranges above.
     ops: [DiffOp]
 
-// Myers, bounded at a million steps. What `diff` does, and the right
+// Myers, bounded at a million steps.  What `diff` does, and the right
 // default for a person reading the output.
 //
 // ```novo
@@ -128,22 +121,41 @@ pub struct DiffHunk
 // println(str.from_int(o.max_steps))
 // ```
 pub fn default_options() -> DiffOptions []
-    todo("diff-nv.diffscript.default_options")
+    DiffOptions { algo: DiffMyers, max_steps: 1000000, max_chain: 64 }
 
-// Unbounded Myers: always minimal, however long it takes. What a test
-// wants, and what `novo fmt --check` wants, because a formatter's diff
+// Unbounded Myers: always minimal, however long it takes.  What a test
+// wants, and what a formatter's check wants, because a formatter's diff
 // is small by construction.
+//
+// ```novo
+// use diffscript
+//
+// println(str.from_int(diffscript.minimal_options().max_steps))   // 0
+// ```
 pub fn minimal_options() -> DiffOptions []
-    todo("diff-nv.diffscript.minimal_options")
+    DiffOptions { algo: DiffMyers, max_steps: 0, max_chain: 64 }
 
 // Patience, bounded as `default_options`.
+//
+// ```novo
+// use diffscript
+//
+// let o = diffscript.patience_options()
+// println(if o.algo == DiffPatience then "patience" else "other")
+// ```
 pub fn patience_options() -> DiffOptions []
-    todo("diff-nv.diffscript.patience_options")
+    DiffOptions { algo: DiffPatience, max_steps: 1000000, max_chain: 64 }
 
-// Histogram with JGit's chain limit of 64. The best default for source
-// code, and what `git diff --histogram` does.
+// Histogram with JGit's chain limit of 64.  What
+// `git diff --histogram` does.
+//
+// ```novo
+// use diffscript
+//
+// println(str.from_int(diffscript.histogram_options().max_chain))   // 64
+// ```
 pub fn histogram_options() -> DiffOptions []
-    todo("diff-nv.diffscript.histogram_options")
+    DiffOptions { algo: DiffHistogram, max_steps: 1000000, max_chain: 64 }
 
 // Diff a tokenised pair.
 //
@@ -156,97 +168,586 @@ pub fn histogram_options() -> DiffOptions []
 // println(if s.minimal then "minimal" else "bounded out")
 // ```
 pub fn diff(input: diffunit.DiffInput, o: DiffOptions) -> DiffScript []
-    todo("diff-nv.diffscript.diff")
+    diff_ids(input.a.ids, input.b.ids, o)
 
-// Diff two lists of token ids. THE INTEGER ENTRY POINT, and it is
-// public on purpose: a caller with tokens of its own — a snapshot
-// library over records, a test harness over syntax trees — interns its
-// own values and never touches `diffunit` at all.
+// Diff two lists of token ids.  A caller with tokens of its own, such
+// as a snapshot library over records or a test harness over syntax
+// trees, numbers its own values and never calls `diffunit`.
 //
 // ```novo
 // use diffscript
 //
 // let s = diffscript.diff_ids([1, 2, 3], [1, 9, 3], diffscript.default_options())
-// println(str.from_int(list.len(s.ops)))
+// println(str.from_int(list.len(s.ops)))   // 3
 // ```
 pub fn diff_ids(a: [Int], b: [Int], o: DiffOptions) -> DiffScript []
-    todo("diff-nv.diffscript.diff_ids")
+    var bud = Budget { max: o.max_steps, used: 0, out: false }
+    let blocks = matched_blocks(a, b, o, bud)
+    DiffScript { ops: ops_of(blocks, list.len(a), list.len(b)), algo: o.algo,
+                 minimal: not bud.out, steps: bud.used }
 
 // The script grouped into hunks with `context` tokens of surrounding
 // equality, the way `diff -U<context>` groups them: two runs of change
-// closer than `2 * context` apart share a hunk.
+// separated by no more than `2 * context` equal tokens share a hunk.
+// No hunks for a script with no change.
+//
+// ```novo
+// use diffscript
+//
+// let s = diffscript.diff_ids([1, 2, 3], [1, 9, 3], diffscript.minimal_options())
+// println(str.from_int(list.len(diffscript.hunks(s, 3))))   // 1
+// ```
 pub fn hunks(s: DiffScript, context: Int) -> [DiffHunk] []
-    todo("diff-nv.diffscript.hunks")
+    let ctx = if context < 0
+        0
+    else
+        context
+    var out: [DiffHunk] = []
+    let n = list.len(s.ops)
+    var i = 0
+    for _ in 0..n
+        if i >= n
+            break
+        if not op_changed(s.ops[i])
+            i = i + 1
+            continue
+        var last = i
+        var j = i + 1
+        for _ in 0..n
+            if j >= n
+                break
+            if op_changed(s.ops[j])
+                last = j
+                j = j + 1
+            elif j + 1 < n and diffunit.range_len(op_a(s.ops[j])) <= 2 * ctx
+                j = j + 1
+            else
+                break
+        list.push(out, hunk_of(s.ops, i, last, ctx))
+        i = last + 1
+    out
 
 // How many tokens the script deletes and how many it inserts, as
-// `(deleted, inserted)` — the two numbers a `--stat` line carries.
+// `(deleted, inserted)`: the two numbers a `--stat` line carries.
+//
+// ```novo
+// use diffscript
+//
+// let c = diffscript.counts(diffscript.diff_ids([1, 2], [1, 3, 4], diffscript.minimal_options()))
+// println("${c.0} ${c.1}")   // 1 2
+// ```
 pub fn counts(s: DiffScript) -> (Int, Int) []
-    todo("diff-nv.diffscript.counts")
+    var deleted = 0
+    var inserted = 0
+    for op in s.ops
+        if op_changed(op)
+            deleted = deleted + diffunit.range_len(op_a(op))
+            inserted = inserted + diffunit.range_len(op_b(op))
+    (deleted, inserted)
 
 // `difflib.SequenceMatcher.ratio`: twice the matched token count over
-// the total token count, in `[0.0, 1.0]`.
+// the total token count, in `[0.0, 1.0]`.  1.0 when both inputs are
+// empty, as in Python.
 //
-// Python's own definition, including that it is NOT a metric — the
-// ratio of `a` to `b` may differ from the ratio of `b` to `a` under a
-// non-minimal script, and the README says so rather than pretending
-// otherwise.
+// It is not a metric: under a non-minimal script, the ratio of `a` to
+// `b` may differ from the ratio of `b` to `a`.
+//
+// ```novo
+// use diffscript
+//
+// let s = diffscript.diff_ids([1, 2, 3, 4], [2, 3, 4, 5], diffscript.minimal_options())
+// println(str.from_float(diffscript.ratio(s, 4, 4)))   // 0.75
+// ```
 pub fn ratio(s: DiffScript, a_len: Int, b_len: Int) -> Float []
-    todo("diff-nv.diffscript.ratio")
+    let total = a_len + b_len
+    if total <= 0
+        return 1.0
+    var matched = 0
+    for op in s.ops
+        if not op_changed(op)
+            matched = matched + diffunit.range_len(op_a(op))
+    (2 * matched) as Float / total as Float
 
-// Whether the script says the two inputs are identical: one
-// `DiffEqual` and nothing else, or nothing at all.
+// Whether the script says the two inputs are identical: one `DiffEqual`
+// and nothing else, or nothing at all.  Two identical texts produce one
+// equal operation, so an empty operation list is not the test.
 //
-// The call `novo fmt --check` and snapshot-nv actually make, and the
-// reason it is a named function is that the obvious test — an empty
-// op list — is wrong: two identical files produce one `DiffEqual`.
+// ```novo
+// use diffscript
+//
+// let s = diffscript.diff_ids([1, 2], [1, 2], diffscript.default_options())
+// println(if diffscript.unchanged(s) then "same" else "changed")   // same
+// ```
 pub fn unchanged(s: DiffScript) -> Bool []
-    todo("diff-nv.diffscript.unchanged")
+    for op in s.ops
+        if op_changed(op)
+            return false
+    true
 
-// The left range of any operation; an empty range for `DiffInsert`.
+// The left range of any operation.  For `DiffInsert` it is the empty
+// range at the insertion point.
+//
+// ```novo
+// use diffscript
+//
+// let r = diffscript.op_a(DiffDelete(DiffRange { start: 2, end: 4 }, DiffRange { start: 1, end: 1 }))
+// println(str.from_int(r.end))   // 4
+// ```
 pub fn op_a(op: DiffOp) -> diffunit.DiffRange []
-    todo("diff-nv.diffscript.op_a")
+    match op
+        DiffEqual(a, _)   => a
+        DiffDelete(a, _)  => a
+        DiffInsert(a, _)  => a
+        DiffReplace(a, _) => a
 
-// The right range of any operation; an empty range for `DiffDelete`.
+// The right range of any operation.  For `DiffDelete` it is the empty
+// range where the deleted tokens would have been.
+//
+// ```novo
+// use diffscript
+//
+// let r = diffscript.op_b(DiffInsert(DiffRange { start: 0, end: 0 }, DiffRange { start: 1, end: 3 }))
+// println(str.from_int(r.start))   // 1
+// ```
 pub fn op_b(op: DiffOp) -> diffunit.DiffRange []
-    todo("diff-nv.diffscript.op_b")
+    match op
+        DiffEqual(_, b)   => b
+        DiffDelete(_, b)  => b
+        DiffInsert(_, b)  => b
+        DiffReplace(_, b) => b
 
 // Whether an operation is anything but `DiffEqual`.
+//
+// ```novo
+// use diffscript
+//
+// println(if diffscript.op_changed(DiffInsert(DiffRange { start: 0, end: 0 }, DiffRange { start: 0, end: 1 })) then "changed" else "equal")
+// ```
 pub fn op_changed(op: DiffOp) -> Bool []
-    todo("diff-nv.diffscript.op_changed")
+    match op
+        DiffEqual(_, _) => false
+        _               => true
 
 // The script that turns the right input back into the left: every
-// delete becomes an insert, every insert a delete, and the two ranges
-// of every equal and replace swap.
+// delete becomes an insert, every insert a delete, and the two ranges of
+// every equal and replace swap.  What `patch -R` needs.
 //
-// What `patch -R` needs, and what a caller undoing an applied patch
-// needs.
+// ```novo
+// use diffscript
+//
+// let s = diffscript.diff_ids([1], [], diffscript.minimal_options())
+// let c = diffscript.counts(diffscript.invert(s))
+// println("${c.0} ${c.1}")   // 0 1
+// ```
 pub fn invert(s: DiffScript) -> DiffScript []
-    todo("diff-nv.diffscript.invert")
+    var ops: [DiffOp] = []
+    for op in s.ops
+        match op
+            DiffEqual(a, b)   => list.push(ops, DiffEqual(b, a))
+            DiffDelete(a, b)  => list.push(ops, DiffInsert(b, a))
+            DiffInsert(a, b)  => list.push(ops, DiffDelete(b, a))
+            DiffReplace(a, b) => list.push(ops, DiffReplace(b, a))
+    DiffScript { ops: ops, algo: s.algo, minimal: s.minimal, steps: s.steps }
 
-// Re-diff one `DiffReplace` at a finer granularity, so a changed line
-// can be shown with the changed WORDS marked.
+// Re-diff the text under one operation at a finer granularity, so a
+// changed line can be shown with the changed words marked.
 //
-// Answers a script over the tokens of that operation's byte spans, in
-// the finer unit's own indices — which is why it takes the input it
-// came from: the finer tokenisation is of the two spans, not of the
-// two files.
+// The answer is a script over the tokens of that operation's two byte
+// spans, in the finer unit's own indices, numbered under the input's
+// policy.  `diffrender.inline_marks` turns it back into byte spans of
+// the input.  This is `similar`'s inline refinement.  It is a separate
+// call because it costs a second diff per changed run, and a caller
+// showing many changed lines can decline it for the ones off screen.
 //
-// This is `similar`'s `iter_inline_changes`, and it is the call that
-// makes a prose diff readable. It is a separate function rather than
-// an option on `diff` because it is quadratic in the size of one
-// changed run and a caller showing ten thousand changed lines must be
-// able to decline it for the ones that are off screen.
+// ```novo
+// use diffunit
+// use diffscript
+//
+// let input = diffunit.tokenize("a b\n", "a c\n", DiffLines)
+// let s = diffscript.diff(input, diffscript.minimal_options())
+// let r = diffscript.refine(input, s.ops[0], DiffWords, diffscript.minimal_options())
+// println(str.from_int(list.len(r.ops)))
+// ```
 pub fn refine(input: diffunit.DiffInput, op: DiffOp, finer: diffunit.DiffUnit,
               o: DiffOptions) -> DiffScript []
-    todo("diff-nv.diffscript.refine")
+    diff(refined_input(input, op, finer), o)
 
 // The longest common subsequence of two id lists, as the pairs of
-// indices that match.
+// indices that match, in order.
 //
-// Published because it is what a caller building something other than
-// a diff out of the same walk needs — a three-way merge's base
-// alignment, a duplicate-block detector — and because it is the piece
-// the algorithms actually compute; `diff_ids` is this plus the pairing
-// of the gaps.
+// What a caller building something other than a diff from the same walk
+// needs, such as a merge's base alignment.  `diff_ids` is this plus the
+// pairing of the gaps.  Under a bounded or non-Myers walk it is a common
+// subsequence and not necessarily the longest.
+//
+// ```novo
+// use diffscript
+//
+// let pairs = diffscript.common_subsequence([1, 2, 3], [1, 9, 3], diffscript.minimal_options())
+// println(str.from_int(list.len(pairs)))   // 2
+// ```
 pub fn common_subsequence(a: [Int], b: [Int], o: DiffOptions) -> [(Int, Int)] []
-    todo("diff-nv.diffscript.common_subsequence")
+    var bud = Budget { max: o.max_steps, used: 0, out: false }
+    var out: [(Int, Int)] = []
+    for blk in matched_blocks(a, b, o, bud)
+        for k in 0..blk.2
+            list.push(out, (blk.0 + k, blk.1 + k))
+    out
+
+// ── The walks ─────────────────────────────────────────────────────────
+
+// The step count of one diff, shared by every region it walks.
+struct Budget
+    max: Int
+    var used: Int
+    // True once the count passed `max`.
+    var out: Bool
+
+// Count one step.  False once the budget is spent.
+fn spend(var bud: Budget, n: Int) -> Bool
+    bud.used = bud.used + n
+    if bud.max > 0 and bud.used > bud.max
+        bud.out = true
+    not bud.out
+
+fn mode_myers() -> Int
+    0
+
+fn mode_patience() -> Int
+    1
+
+fn mode_histogram() -> Int
+    2
+
+fn mode_of(algo: DiffAlgo) -> Int
+    match algo
+        DiffMyers     => mode_myers()
+        DiffPatience  => mode_patience()
+        DiffHistogram => mode_histogram()
+
+// The equal runs of a diff of `a` against `b`, as `(a_start, b_start,
+// length)`, sorted and with neighbouring runs joined.
+fn matched_blocks(a: [Int], b: [Int], o: DiffOptions, var bud: Budget) -> [(Int, Int, Int)]
+    var blocks: [(Int, Int, Int)] = []
+    var work: [(Int, Int, Int, Int, Int)] = [(0, list.len(a), 0, list.len(b), mode_of(o.algo))]
+    var next = 0
+    loop
+        if next >= list.len(work)
+            break
+        let r = work[next]
+        next = next + 1
+        walk_region(a, b, r, o, bud, blocks, work)
+    list.sort(blocks)
+    joined(blocks)
+
+// Walk one region: take off its common prefix and suffix, then match
+// the rest by the region's walk, pushing any sub-regions onto `work`.
+fn walk_region(a: [Int], b: [Int], r: (Int, Int, Int, Int, Int), o: DiffOptions, var bud: Budget,
+               var blocks: [(Int, Int, Int)], var work: [(Int, Int, Int, Int, Int)])
+    var as0 = r.0
+    var ae = r.1
+    var bs = r.2
+    var be = r.3
+    let start_a = as0
+    let start_b = bs
+    for _ in 0..ae - as0
+        if bs >= be or a[as0] != b[bs]
+            break
+        as0 = as0 + 1
+        bs = bs + 1
+    if as0 > start_a
+        list.push(blocks, (start_a, start_b, as0 - start_a))
+    var tail = 0
+    for _ in 0..ae - as0
+        if be - tail <= bs or a[ae - 1 - tail] != b[be - 1 - tail]
+            break
+        tail = tail + 1
+    if tail > 0
+        ae = ae - tail
+        be = be - tail
+        list.push(blocks, (ae, be, tail))
+    if as0 >= ae or bs >= be
+        return
+    if r.4 == mode_patience()
+        if not patience_split(a, b, as0, ae, bs, be, blocks, work)
+            myers_or_coarse(a, b, as0, ae, bs, be, bud, blocks)
+    elif r.4 == mode_histogram()
+        if not histogram_split(a, b, as0, ae, bs, be, o.max_chain, blocks, work)
+            myers_or_coarse(a, b, as0, ae, bs, be, bud, blocks)
+    elif not myers(a, b, as0, ae, bs, be, bud, blocks)
+        list.push(work, (as0, ae, bs, be, mode_histogram()))
+
+// Myers on a region, and nothing matched in it when the budget is
+// spent: the region is then one replacement, which is correct.
+fn myers_or_coarse(a: [Int], b: [Int], as0: Int, ae: Int, bs: Int, be: Int, var bud: Budget,
+                   var blocks: [(Int, Int, Int)])
+    let _ = myers(a, b, as0, ae, bs, be, bud, blocks)
+
+// Myers' greedy forward walk (Myers 1986, section 2) over the region,
+// keeping one row of furthest-reaching points per edit distance so the
+// path can be read back.  False, with nothing added, when the budget
+// runs out first.  The region has lost its common prefix, so the path
+// leaves the origin with an edit and not with a diagonal.
+fn myers(a: [Int], b: [Int], as0: Int, ae: Int, bs: Int, be: Int, var bud: Budget,
+         var blocks: [(Int, Int, Int)]) -> Bool
+    let n = ae - as0
+    let m = be - bs
+    let most = n + m
+    let off = most + 1
+    var v: [Int] = []
+    for _ in 0..2 * most + 3
+        list.push(v, 0)
+    var trace: [[Int]] = []
+    var final_d = -1
+    for d in 0..most + 1
+        for i in 0..d + 1
+            let k = 2 * i - d
+            if not spend(bud, 1)
+                return false
+            var x = 0
+            if k == -d or k != d and v[off + k - 1] < v[off + k + 1]
+                x = v[off + k + 1]
+            else
+                x = v[off + k - 1] + 1
+            var y = x - k
+            let x0 = x
+            for _ in 0..n - x0
+                if x >= n or y >= m or a[as0 + x] != b[bs + y]
+                    break
+                x = x + 1
+                y = y + 1
+            if x > x0 and not spend(bud, x - x0)
+                return false
+            v[off + k] = x
+            if x >= n and y >= m
+                final_d = d
+                break
+        list.push(trace, v[off - d - 1:off + d + 2])
+        if final_d >= 0
+            break
+    var x = n
+    var y = m
+    var d = final_d
+    for _ in 0..final_d + 1
+        if d == 0
+            break
+        let row = trace[d - 1]
+        let k = x - y
+        var prev_k = k - 1
+        if k == -d or k != d and row[k - 1 + d] < row[k + 1 + d]
+            prev_k = k + 1
+        let prev_x = row[prev_k + d]
+        let prev_y = prev_x - prev_k
+        let mid_x = if prev_k == k + 1
+            prev_x
+        else
+            prev_x + 1
+        if x > mid_x
+            list.push(blocks, (as0 + mid_x, bs + mid_x - k, x - mid_x))
+        x = prev_x
+        y = prev_y
+        d = d - 1
+    true
+
+// Patience: the tokens that occur exactly once in each side of the
+// region, in the longest run whose order agrees on both sides.  False
+// when there is no such token.
+fn patience_split(a: [Int], b: [Int], as0: Int, ae: Int, bs: Int, be: Int,
+                  var blocks: [(Int, Int, Int)], var work: [(Int, Int, Int, Int, Int)]) -> Bool
+    var count_a: HashMap<Int, Int> = HashMap.new()
+    var count_b: HashMap<Int, Int> = HashMap.new()
+    var where_b: HashMap<Int, Int> = HashMap.new()
+    for i in as0..ae
+        count_a.set(a[i], (count_a.get(a[i]) ?? 0) + 1)
+    for j in bs..be
+        count_b.set(b[j], (count_b.get(b[j]) ?? 0) + 1)
+        where_b.set(b[j], j)
+    var cands: [(Int, Int)] = []
+    for i in as0..ae
+        let id = a[i]
+        if (count_a.get(id) ?? 0) == 1 and (count_b.get(id) ?? 0) == 1
+            list.push(cands, (i, where_b.get(id) ?? 0))
+    if list.len(cands) == 0
+        return false
+    let anchors = increasing_run(cands)
+    var pa = as0
+    var pb = bs
+    for p in anchors
+        list.push(work, (pa, p.0, pb, p.1, mode_patience()))
+        list.push(blocks, (p.0, p.1, 1))
+        pa = p.0 + 1
+        pb = p.1 + 1
+    list.push(work, (pa, ae, pb, be, mode_patience()))
+    true
+
+// The longest subsequence of `cands` (ordered by their first member)
+// whose second members increase, by patience sorting.
+fn increasing_run(cands: [(Int, Int)]) -> [(Int, Int)]
+    var tops: [Int] = []
+    var back: [Int] = []
+    for i in 0..list.len(cands)
+        let key = cands[i].1
+        var lo = 0
+        var hi = list.len(tops)
+        for _ in 0..list.len(cands)
+            if lo >= hi
+                break
+            let mid = (lo + hi) / 2
+            if cands[tops[mid]].1 < key
+                lo = mid + 1
+            else
+                hi = mid
+        list.push(back, (if lo > 0 then tops[lo - 1] else -1))
+        if lo == list.len(tops)
+            list.push(tops, i)
+        else
+            tops[lo] = i
+    var picked: [(Int, Int)] = []
+    var at = tops[list.len(tops) - 1]
+    for _ in 0..list.len(cands)
+        if at < 0
+            break
+        list.push(picked, cands[at])
+        at = back[at]
+    list.reverse(picked)
+    picked
+
+// Histogram: the equal region around the rarest token the two sides
+// share, among tokens that occur no more than `max_chain` times on the
+// left.  False when there is none.
+fn histogram_split(a: [Int], b: [Int], as0: Int, ae: Int, bs: Int, be: Int, max_chain: Int,
+                   var blocks: [(Int, Int, Int)], var work: [(Int, Int, Int, Int, Int)]) -> Bool
+    var count: HashMap<Int, Int> = HashMap.new()
+    var first: HashMap<Int, Int> = HashMap.new()
+    var next: [Int] = []
+    for _ in as0..ae
+        list.push(next, -1)
+    for back_i in 0..ae - as0
+        let i = ae - 1 - back_i
+        let id = a[i]
+        next[i - as0] = first.get(id) ?? -1
+        first.set(id, i)
+        count.set(id, (count.get(id) ?? 0) + 1)
+    var best_count = max_chain + 1
+    var best = (0, 0, 0, 0)
+    var j = bs
+    for _ in bs..be
+        if j >= be
+            break
+        var skip_to = j + 1
+        let c = count.get(b[j]) ?? 0
+        if c > 0 and c <= max_chain and c <= best_count
+            var i = first.get(b[j]) ?? -1
+            for _ in 0..c
+                var s_a = i
+                var s_b = j
+                var rare = c
+                for _ in 0..i - as0
+                    if s_a <= as0 or s_b <= bs or a[s_a - 1] != b[s_b - 1]
+                        break
+                    s_a = s_a - 1
+                    s_b = s_b - 1
+                    rare = min_int(rare, count.get(a[s_a]) ?? 0)
+                var e_a = i + 1
+                var e_b = j + 1
+                for _ in 0..ae - i
+                    if e_a >= ae or e_b >= be or a[e_a] != b[e_b]
+                        break
+                    rare = min_int(rare, count.get(a[e_a]) ?? 0)
+                    e_a = e_a + 1
+                    e_b = e_b + 1
+                if rare < best_count or rare == best_count and e_a - s_a > best.1 - best.0
+                    best_count = rare
+                    best = (s_a, e_a, s_b, e_b)
+                if e_b > skip_to
+                    skip_to = e_b
+                i = next[i - as0]
+        j = skip_to
+    if best_count > max_chain
+        return false
+    list.push(blocks, (best.0, best.2, best.1 - best.0))
+    list.push(work, (as0, best.0, bs, best.2, mode_histogram()))
+    list.push(work, (best.1, ae, best.3, be, mode_histogram()))
+    true
+
+fn min_int(x: Int, y: Int) -> Int
+    if x < y
+        x
+    else
+        y
+
+fn max_int(x: Int, y: Int) -> Int
+    if x > y
+        x
+    else
+        y
+
+// Sorted runs with neighbours that continue each other joined into one.
+fn joined(blocks: [(Int, Int, Int)]) -> [(Int, Int, Int)]
+    var out: [(Int, Int, Int)] = []
+    for blk in blocks
+        let n = list.len(out)
+        if n > 0 and out[n - 1].0 + out[n - 1].2 == blk.0 and out[n - 1].1 + out[n - 1].2 == blk.1
+            out[n - 1] = (out[n - 1].0, out[n - 1].1, out[n - 1].2 + blk.2)
+        else
+            list.push(out, blk)
+    out
+
+// The operations that tile `[0, n)` and `[0, m)`, given the equal runs.
+fn ops_of(blocks: [(Int, Int, Int)], n: Int, m: Int) -> [DiffOp]
+    var ops: [DiffOp] = []
+    var ai = 0
+    var bi = 0
+    for blk in blocks
+        push_gap(ops, ai, blk.0, bi, blk.1)
+        list.push(ops, DiffEqual(DiffRange { start: blk.0, end: blk.0 + blk.2 },
+                                 DiffRange { start: blk.1, end: blk.1 + blk.2 }))
+        ai = blk.0 + blk.2
+        bi = blk.1 + blk.2
+    push_gap(ops, ai, n, bi, m)
+    ops
+
+fn push_gap(var ops: [DiffOp], a0: Int, a1: Int, b0: Int, b1: Int)
+    let ra = DiffRange { start: a0, end: a1 }
+    let rb = DiffRange { start: b0, end: b1 }
+    if a1 > a0 and b1 > b0
+        list.push(ops, DiffReplace(ra, rb))
+    elif a1 > a0
+        list.push(ops, DiffDelete(ra, rb))
+    elif b1 > b0
+        list.push(ops, DiffInsert(ra, rb))
+
+// ── Hunks ─────────────────────────────────────────────────────────────
+
+// The hunk around the changed operations `first..=last`, with `ctx`
+// equal tokens taken from the equal operations on each side.
+fn hunk_of(ops: [DiffOp], first: Int, last: Int, ctx: Int) -> DiffHunk
+    var inner: [DiffOp] = []
+    if first > 0 and ctx > 0
+        let pa = op_a(ops[first - 1])
+        let pb = op_b(ops[first - 1])
+        let k = min_int(ctx, diffunit.range_len(pa))
+        list.push(inner, DiffEqual(DiffRange { start: pa.end - k, end: pa.end },
+                                   DiffRange { start: pb.end - k, end: pb.end }))
+    for i in first..last + 1
+        list.push(inner, ops[i])
+    if last + 1 < list.len(ops) and ctx > 0
+        let na = op_a(ops[last + 1])
+        let nb = op_b(ops[last + 1])
+        let k = min_int(ctx, diffunit.range_len(na))
+        list.push(inner, DiffEqual(DiffRange { start: na.start, end: na.start + k },
+                                   DiffRange { start: nb.start, end: nb.start + k }))
+    let lo = inner[0]
+    let hi = inner[list.len(inner) - 1]
+    DiffHunk { a: DiffRange { start: op_a(lo).start, end: op_a(hi).end },
+               b: DiffRange { start: op_b(lo).start, end: op_b(hi).end },
+               ops: inner }
+
+// The input a refinement diffs: the text under `op` on each side, cut
+// at `finer`.
+fn refined_input(input: diffunit.DiffInput, op: DiffOp,
+                 finer: diffunit.DiffUnit) -> diffunit.DiffInput
+    let sa = diffunit.range_span(input.a, op_a(op))
+    let sb = diffunit.range_span(input.b, op_b(op))
+    diffunit.tokenize_with(diffunit.span_str(input.a, sa), diffunit.span_str(input.b, sb),
+                           finer, input.policy)
