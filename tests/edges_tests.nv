@@ -510,3 +510,42 @@ fn test_the_rarer_answers_of_the_merge() [io]
 
     test.case("conflicts_only leaves out what a favour resolved")
     test.assert(list.len(diffmerge.conflicts_only(base, ours, theirs, fu)) == 0)
+
+@test
+fn test_the_branches_of_the_rarer_shapes() [io]
+    test.case("zdiff3 narrows a conflict whose sides differ in length")
+    let z = diffmerge.merge3("a\nb\nc\n", "a\nX\nc\n", "a\nX\nY\nZ\nc\n",
+                             diffmerge.diff3_options("B", "O", "T"))
+    test.assert(z.text == "a\nX\n<<<<<<< O\n||||||| B\nb\n=======\nY\nZ\n>>>>>>> T\nc\n")
+
+    test.case("a hunk that deletes into an empty right side becomes a script")
+    let p = parse_or_empty("--- a\n+++ b\n@@ -2 +1,0 @@\n-b\n")
+    let files = p.files
+    let c = diffscript.counts(diffpatch.script_of(files[0]))
+    test.assert(c.0 == 1)
+    test.assert(c.1 == 0)
+
+    test.case("a gutter with no bar keeps its text for every row")
+    let input = diffunit.tokenize("a\n", "b\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let plain = DiffColumnOptions { context: 3, width: 2, gutter: "::", cluster_width: one, wrap: false }
+    var buf: [u8] = []
+    diffrender.side_by_side_into(buf, input, s, plain)
+    test.assert(str.contains(bytes.byte_list_to_str(buf), "a ::b\n"))
+
+    test.case("a right column that wraps past the left one")
+    let long = diffunit.tokenize("a\n", "bbbbbbbbbb\n", DiffLines)
+    let wrap = DiffColumnOptions { context: 3, width: 4, gutter: " | ", cluster_width: one, wrap: true }
+    var wbuf: [u8] = []
+    diffrender.side_by_side_into(wbuf, long, diffscript.diff(long, diffscript.minimal_options()), wrap)
+    test.assert(str.contains(bytes.byte_list_to_str(wbuf), "a    | bbbb\n       bbbb\n       bb\n"))
+
+    test.case("a negative context is no context")
+    test.assert(list.len(diffscript.hunks(s, -1)) == 1)
+
+    test.case("fuzz drops a leading context line where there is no trailing one")
+    let fz = DiffApplyOptions { fuzz: 1, max_offset: 0, reverse: false, ignore_whitespace: false,
+                                detect_already_applied: false }
+    let r = applied("z\nb\n", "--- a\n+++ b\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n", fz)
+    test.assert(r.text == "z\nB\n")
+    test.assert(r.placed[0].fuzz_used == 1)

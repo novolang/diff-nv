@@ -265,7 +265,7 @@ novo test tests/diffscript_tests.nv    # 10 tests: the three walks and the bound
 novo test tests/diffrender_tests.nv    # 10 tests: unified output and the row list
 novo test tests/diffpatch_tests.nv     #  8 tests: parsing, offset, fuzz and rejects
 novo test tests/diffmerge_tests.nv     #  9 tests: clean merges, conflicts and markers
-novo test tests/edges_tests.nv         # 15 tests: fallbacks, policies, rarer answers
+novo test tests/edges_tests.nv         # 16 tests: fallbacks, policies, rarer answers
 novo test tests/differential_tests.nv  #  4 tests: against GNU diffutils and difflib
 bash tests/patch_roundtrip.sh          # 180 diffs applied by GNU patch
 bash tests/coverage.sh                 # line coverage over src/
