@@ -1,16 +1,9 @@
-// diffrender_tests.nv — the bytes, and the rows somebody else paints.
+// diffrender_tests.nv — the bytes, and the rows a caller paints.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
-//
-// THE VECTORS ARE `diff -u`'s OWN.  A unified diff is an interchange
-// format — `patch(1)` and `git apply` both read it — so the header
-// tests are byte comparisons against what GNU diffutils writes, taken
-// from its `tests/` corpus, and not against what looks reasonable.
-// The three rules that catch every hand-rolled renderer are each their
-// own case: the count is omitted when it is 1, the start is 0 for an
-// empty range, and the `\ No newline at end of file` marker follows
-// the line it qualifies rather than ending the hunk.
+// Three rules catch most hand-written unified renderers, and each has
+// its own case: the line count is left out when it is 1, the start is
+// the line before an empty range, and `\ No newline at end of file`
+// follows the line it qualifies.
 
 use std.test
 use std.list
@@ -115,7 +108,7 @@ fn test_the_row_list_is_what_an_editor_paints() [io]
             _             =>
                 pass
 
-    test.case("a context line that BEGINS with a minus is still a context row")
+    test.case("a context line that begins with a minus is still a context row")
     let tricky = diffunit.tokenize("-x\nold\n", "-x\nnew\n", DiffLines)
     let ts = diffscript.diff(tricky, diffscript.minimal_options())
     let trows = diffrender.lines(tricky, ts, 3)
@@ -133,7 +126,7 @@ fn test_the_row_list_is_what_an_editor_paints() [io]
 fn test_the_buffer_form_appends_and_never_replaces() [io]
     let input = diffunit.tokenize("a\n", "b\n", DiffLines)
     let s = diffscript.diff(input, diffscript.minimal_options())
-    let seed: [u8] = [104, 105]
+    var seed: [u8] = [104, 105]
 
     test.case("what was already in the buffer is still at the front")
     let out = diffrender.unified_into(seed, input, s, diffrender.unified_options(0))
@@ -141,11 +134,11 @@ fn test_the_buffer_form_appends_and_never_replaces() [io]
     test.assert(out[1] == 105)
     test.assert(list.len(out) > 2)
 
+fn ascii_width(cluster: Str) -> Int
+    1
+
 @test
 fn test_side_by_side_measures_columns_with_the_callers_width_function() [io]
-    fn ascii_width(cluster: Str) -> Int
-        1
-
     let input = diffunit.tokenize("aaa\n", "bbb\n", DiffLines)
     let s = diffscript.diff(input, diffscript.minimal_options())
     let o = diffrender.column_options(10, ascii_width)
@@ -154,14 +147,14 @@ fn test_side_by_side_measures_columns_with_the_callers_width_function() [io]
     test.assert(o.width == 10)
 
     test.case("and the layout uses it rather than counting bytes")
-    let empty: [u8] = []
+    var empty: [u8] = []
     let out = diffrender.side_by_side_into(empty, input, s, o)
     test.assert(list.len(out) > 0)
 
 @test
 fn test_the_stat_line_is_gits_wording() [io]
     test.case("one insertion and one deletion, in git's own words")
-    let empty: [u8] = []
+    var empty: [u8] = []
     let out = diffrender.stat_line_into(empty, "a.txt", 1, 1)
     let text = bytes.byte_list_to_str(out)
     test.assert(str.index(text, "1 insertion(+)") != None)
@@ -193,7 +186,7 @@ fn test_the_header_can_be_written_without_the_body() [io]
     let hs = diffscript.hunks(s, 1)
 
     test.case("hunk_header_into writes the @@ line alone, for a caller rendering its own body")
-    let empty: [u8] = []
+    var empty: [u8] = []
     let out = diffrender.hunk_header_into(empty, hs[0], "")
     let text = bytes.byte_list_to_str(out)
     test.assert(str.index(text, "@@ -1,3 +1,3 @@") != None)
@@ -215,7 +208,7 @@ fn test_inline_marks_are_spans_and_not_markers_in_a_string() [io]
             DiffReplace(a, b) =>
                 let refined = diffscript.refine(input, DiffReplace(a, b), DiffWords,
                                                 diffscript.minimal_options())
-                let marks = diffrender.inline_marks(input, refined, DiffReplace(a, b))
+                let marks = diffrender.inline_marks(input, refined, DiffReplace(a, b), DiffWords)
                 test.assert(list.len(marks.0) > 0)
                 test.assert(list.len(marks.1) > 0)
             _                 =>

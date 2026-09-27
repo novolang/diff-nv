@@ -1,0 +1,261 @@
+// differential_tests.nv — this package against GNU diffutils and
+// Python's difflib, which answer the same questions independently.
+//
+// Written by tools/differential.py; do not edit by hand.  Each vector
+// is two texts, the line counts GNU `diff --minimal` deletes and
+// inserts, the number of lines difflib matches, and the unified diff
+// GNU `diff -U3` writes.  See the script for what each is compared
+// with.
+
+use std.test
+use std.list
+use diffunit
+use diffscript
+use diffrender
+use diffpatch
+
+struct Vector
+    a: Str
+    b: Str
+    deleted: Int
+    inserted: Int
+    difflib_matched: Int
+    gnu_unified: Str
+
+fn vectors() -> [Vector]
+    [
+        Vector { a: "c\n", b: "c\n",
+                 deleted: 0, inserted: 0, difflib_matched: 1,
+                 gnu_unified: "" },
+        Vector { a: "    y\nb\n}\nreturn 0\n    x\n}\nc\n    y\nb\n    x\n    x\nd\n    y\n", b: "    y\nb\n}\nreturn 0\n    x\n}\nc\n    y\nb\n    x\nd\nd\n    y\n",
+                 deleted: 1, inserted: 1, difflib_matched: 12,
+                 gnu_unified: "--- a\n+++ b\n@@ -8,6 +8,6 @@\n     y\n b\n     x\n-    x\n+d\n d\n     y\n" },
+        Vector { a: "c\nfn main()\n    x\n}\nb\n}\n    x\nb\n    x\nreturn 0\nfn main()\n", b: "c\nfn main()\n    x\n}\nb\n    x\nb\n    x\nreturn 0\nfn main()\n",
+                 deleted: 1, inserted: 0, difflib_matched: 10,
+                 gnu_unified: "--- a\n+++ b\n@@ -3,7 +3,6 @@\n     x\n }\n b\n-}\n     x\n b\n     x\n" },
+        Vector { a: "c\n    y\n    y\nreturn 0\nfn main()\n", b: "c\nb\n    y\n    y\nreturn 0\nfn main()\n",
+                 deleted: 0, inserted: 1, difflib_matched: 5,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,5 @@\n c\n+b\n     y\n     y\n return 0\n" },
+        Vector { a: "d\n\nb\n", b: "d\nreturn 0\n    y\nb\nb",
+                 deleted: 1, inserted: 3, difflib_matched: 2,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,3 +1,5 @@\n d\n-\n+return 0\n+    y\n b\n+b\n\\ No newline at end of file\n" },
+        Vector { a: "return 0\n}\nfn main()\nb\nfn main()\nc\nc\nreturn 0\n}\n", b: "}\nfn main()\nb\nfn main()\nc\nc\nreturn 0\n}\n",
+                 deleted: 1, inserted: 0, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,3 @@\n-return 0\n }\n fn main()\n b\n" },
+        Vector { a: "    y\na\nc\nc\nb\n    x\n}\n", b: "return 0\n    x\nc\nc\nb\nfn main()\n    x\n}\n",
+                 deleted: 2, inserted: 3, difflib_matched: 5,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,7 +1,8 @@\n-    y\n-a\n+return 0\n+    x\n c\n c\n b\n+fn main()\n     x\n }\n" },
+        Vector { a: "fn main()\n    y\nreturn 0\nd\nb\n}\n}\nd\na\n", b: "fn main()\n    y\nreturn 0\nd\n}\n}\na",
+                 deleted: 3, inserted: 1, difflib_matched: 6,
+                 gnu_unified: "--- a\n+++ b\n@@ -2,8 +2,6 @@\n     y\n return 0\n d\n-b\n }\n }\n-d\n-a\n+a\n\\ No newline at end of file\n" },
+        Vector { a: "", b: "",
+                 deleted: 0, inserted: 0, difflib_matched: 0,
+                 gnu_unified: "" },
+        Vector { a: "    x\nreturn 0\nb\n    y\nreturn 0\nreturn 0\n    y\nreturn 0\n", b: "    x\nreturn 0\nb\n    y\nreturn 0\nreturn 0\n    y\nreturn 0\n",
+                 deleted: 0, inserted: 0, difflib_matched: 8,
+                 gnu_unified: "" },
+        Vector { a: "d\nc\nfn main()\n}\nreturn 0\nc\na\n", b: "d\nc\nfn main()\n}\nreturn 0\nc\na\n",
+                 deleted: 0, inserted: 0, difflib_matched: 7,
+                 gnu_unified: "" },
+        Vector { a: "b\n}\na\nb\nb\nfn main()\nd\na\n", b: "b\n}\na\nb\n    y\nfn main()\nb\nd\na",
+                 deleted: 2, inserted: 3, difflib_matched: 6,
+                 gnu_unified: "--- a\n+++ b\n@@ -2,7 +2,8 @@\n }\n a\n b\n-b\n+    y\n fn main()\n+b\n d\n-a\n+a\n\\ No newline at end of file\n" },
+        Vector { a: "return 0\na\nd\n", b: "    x\nd\na\nb\n",
+                 deleted: 2, inserted: 3, difflib_matched: 1,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,3 +1,4 @@\n-return 0\n-a\n+    x\n d\n+a\n+b\n" },
+        Vector { a: "\nb\n}\nb\nc\n", b: "\nb\n}\nb\nc\n",
+                 deleted: 0, inserted: 0, difflib_matched: 5,
+                 gnu_unified: "" },
+        Vector { a: "d\n}\na\n}\n    y\n    x\nd\n    x\n}\n\n}\nc\nc\n", b: "d\n}\na\n}\n    y\n    x\nd\n    x\n}\n}\nc\nc",
+                 deleted: 2, inserted: 1, difflib_matched: 11,
+                 gnu_unified: "--- a\n+++ b\n@@ -7,7 +7,6 @@\n d\n     x\n }\n-\n }\n c\n-c\n+c\n\\ No newline at end of file\n" },
+        Vector { a: "}\nreturn 0\nd\na\nc\nfn main()\n    y\n    y\na\nd\n", b: "}\nreturn 0\nd\na\nc\nfn main()\n    x\n    y\nd\n",
+                 deleted: 2, inserted: 1, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -4,7 +4,6 @@\n a\n c\n fn main()\n+    x\n     y\n-    y\n-a\n d\n" },
+        Vector { a: "\nc\n", b: "\na\nd\nc\n",
+                 deleted: 0, inserted: 2, difflib_matched: 2,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,2 +1,4 @@\n \n+a\n+d\n c\n" },
+        Vector { a: "}\n    x\nfn main()\n}\n    x\n", b: "}\n    x\nfn main()\n}\n    x\n",
+                 deleted: 0, inserted: 0, difflib_matched: 5,
+                 gnu_unified: "" },
+        Vector { a: "    y\n", b: "    y\n",
+                 deleted: 0, inserted: 0, difflib_matched: 1,
+                 gnu_unified: "" },
+        Vector { a: "}\nreturn 0\na\n    x\n", b: "}\nreturn 0\na\n    x\n",
+                 deleted: 0, inserted: 0, difflib_matched: 4,
+                 gnu_unified: "" },
+        Vector { a: "    x\nreturn 0\n    y\n    y\na\na\n\n", b: "return 0\n    y\n    y\nreturn 0\n}\n",
+                 deleted: 4, inserted: 2, difflib_matched: 3,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,7 +1,5 @@\n-    x\n return 0\n     y\n     y\n-a\n-a\n-\n+return 0\n+}\n" },
+        Vector { a: "c\n    y\na\nd\nc\nd\n", b: "c\nfn main()\n    y\na\nd\nc\n}\nb\nd\n",
+                 deleted: 0, inserted: 3, difflib_matched: 6,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,6 +1,9 @@\n c\n+fn main()\n     y\n a\n d\n c\n+}\n+b\n d\n" },
+        Vector { a: "fn main()\nc\n", b: "d\n",
+                 deleted: 2, inserted: 1, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,2 +1 @@\n-fn main()\n-c\n+d\n" },
+        Vector { a: "    y\n    y\n    y\n    y\nreturn 0\n}\n}\n    x\n", b: "    y\n    y\n    y\n    y\nreturn 0\nfn main()\n}\n    x\n",
+                 deleted: 1, inserted: 1, difflib_matched: 7,
+                 gnu_unified: "--- a\n+++ b\n@@ -3,6 +3,6 @@\n     y\n     y\n return 0\n-}\n+fn main()\n }\n     x\n" },
+        Vector { a: "b\n\nreturn 0\nfn main()\n", b: "b\nreturn 0\n    x\nd\nfn main()\n",
+                 deleted: 1, inserted: 2, difflib_matched: 3,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,5 @@\n b\n-\n return 0\n+    x\n+d\n fn main()\n" },
+        Vector { a: "return 0\nd\nreturn 0\n    x\n    y\n}\na\n}\n    x\nfn main()\n    x\n\n", b: "return 0\nd\nreturn 0\n    x\n\n    y\n    x\n}\na\n}\nfn main()\n    x\nb\n",
+                 deleted: 2, inserted: 3, difflib_matched: 10,
+                 gnu_unified: "--- a\n+++ b\n@@ -2,11 +2,12 @@\n d\n return 0\n     x\n+\n     y\n+    x\n }\n a\n }\n-    x\n fn main()\n     x\n-\n+b\n" },
+        Vector { a: "\nd\n\nc\na\n", b: "d\n    y\n\nc\na\n",
+                 deleted: 1, inserted: 1, difflib_matched: 4,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,5 +1,5 @@\n-\n d\n+    y\n \n c\n a\n" },
+        Vector { a: "    y\n}\n\nreturn 0\n    x\n", b: "    y\n}\n\nreturn 0\n    x\n",
+                 deleted: 0, inserted: 0, difflib_matched: 5,
+                 gnu_unified: "" },
+        Vector { a: "b\nd\nd\nc\n\n    x\na\nc\nd\nc\nreturn 0\n}\n    x\n", b: "b\nfn main()\nd\nd\n    x\nc\n\n    x\na\nd\n\nreturn 0\n    y\n    x\n",
+                 deleted: 3, inserted: 4, difflib_matched: 10,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,13 +1,14 @@\n b\n+fn main()\n d\n d\n+    x\n c\n \n     x\n a\n-c\n d\n-c\n+\n return 0\n-}\n+    y\n     x\n" },
+        Vector { a: "}\nc\n\nc\na\n\nreturn 0\nc\n\nb\n", b: "}\nc\n\nc\na\n\nreturn 0\nc\nb",
+                 deleted: 2, inserted: 1, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -6,5 +6,4 @@\n \n return 0\n c\n-\n-b\n+b\n\\ No newline at end of file\n" },
+        Vector { a: "c\n\n\nfn main()\na\nc\n    x\n", b: "return 0\nreturn 0\nd\nfn main()\na\nc\n    x\n",
+                 deleted: 3, inserted: 3, difflib_matched: 4,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,6 +1,6 @@\n-c\n-\n-\n+return 0\n+return 0\n+d\n fn main()\n a\n c\n" },
+        Vector { a: "fn main()\nreturn 0\n\n    x\n\n\n", b: "}\nreturn 0\n\n    x\n\n\n",
+                 deleted: 1, inserted: 1, difflib_matched: 5,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,4 @@\n-fn main()\n+}\n return 0\n \n     x\n" },
+        Vector { a: "    x\n", b: "return 0\n",
+                 deleted: 1, inserted: 1, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -1 +1 @@\n-    x\n+return 0\n" },
+        Vector { a: "return 0\n}\nb\na\n\na\nb\nreturn 0\n    y\nreturn 0\n", b: "return 0\n}\nb\na\n\na\nb\n    y\n    x\nreturn 0",
+                 deleted: 2, inserted: 2, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -5,6 +5,6 @@\n \n a\n b\n-return 0\n     y\n-return 0\n+    x\n+return 0\n\\ No newline at end of file\n" },
+        Vector { a: "    x\n    x\n", b: "",
+                 deleted: 2, inserted: 0, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,2 +0,0 @@\n-    x\n-    x\n" },
+        Vector { a: "    y\nreturn 0\nd\nb\nb\n    y\na\n    x\n", b: "return 0\n    x\nreturn 0\n    y\nd\nb\nb\n    y\na\n    x\n",
+                 deleted: 1, inserted: 3, difflib_matched: 7,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,5 +1,7 @@\n-    y\n return 0\n+    x\n+return 0\n+    y\n d\n b\n b\n" },
+        Vector { a: "d\nb\n    x\nd\n", b: "d\nb\n    x\nd",
+                 deleted: 1, inserted: 1, difflib_matched: 3,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,4 @@\n d\n b\n     x\n-d\n+d\n\\ No newline at end of file\n" },
+        Vector { a: "", b: "\n",
+                 deleted: 0, inserted: 1, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -0,0 +1 @@\n+\n" },
+        Vector { a: "b\n    y\nb\n    x\n\n\n", b: "b\n    y\nb\n    x\nd\na\nc\n",
+                 deleted: 2, inserted: 3, difflib_matched: 4,
+                 gnu_unified: "--- a\n+++ b\n@@ -2,5 +2,6 @@\n     y\n b\n     x\n-\n-\n+d\n+a\n+c\n" },
+        Vector { a: "fn main()\n    y\nd\n    y\nb\na\n    y\nb\n", b: "d\n    y\nd\n    y\nb\na\na\nb",
+                 deleted: 3, inserted: 3, difflib_matched: 5,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,8 +1,8 @@\n-fn main()\n+d\n     y\n d\n     y\n b\n a\n-    y\n-b\n+a\n+b\n\\ No newline at end of file\n" },
+        Vector { a: "b\nc\nc\n}\na\nreturn 0\nreturn 0\nd\n    x\na\n", b: "a\nb\nb\nc\n}\na\nreturn 0\nreturn 0\n    x\nd\n    y\na\n",
+                 deleted: 2, inserted: 4, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,10 +1,12 @@\n+a\n+b\n b\n-c\n c\n }\n a\n return 0\n return 0\n-d\n     x\n+d\n+    y\n a\n" },
+        Vector { a: "a\nc\nd\n    x\n    x\nc\nb\n    x\nfn main()\nd\n}\nc\n", b: "c\na\n    x\na\nc\nb\n    x\n    y\nfn main()\nd\nc\n",
+                 deleted: 4, inserted: 3, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,12 +1,11 @@\n-a\n c\n-d\n-    x\n+a\n     x\n+a\n c\n b\n     x\n+    y\n fn main()\n d\n-}\n c\n" },
+        Vector { a: "c\n    x\n    y\n\nc\n}\n\nd\n    x\na\nfn main()\n", b: "c\n    x\n    y\n\nc\n}\n\nd\n    x\na\n",
+                 deleted: 1, inserted: 0, difflib_matched: 10,
+                 gnu_unified: "--- a\n+++ b\n@@ -8,4 +8,3 @@\n d\n     x\n a\n-fn main()\n" },
+        Vector { a: "", b: "return 0\nd\n",
+                 deleted: 0, inserted: 2, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -0,0 +1,2 @@\n+return 0\n+d\n" },
+        Vector { a: "}\nd\nc\nfn main()\n", b: "c\n}\nd\nc\nreturn 0\n",
+                 deleted: 1, inserted: 2, difflib_matched: 3,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,5 @@\n+c\n }\n d\n c\n-fn main()\n+return 0\n" },
+        Vector { a: "c\nreturn 0\n", b: "\nreturn 0\na\n",
+                 deleted: 1, inserted: 2, difflib_matched: 1,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,2 +1,3 @@\n-c\n+\n return 0\n+a\n" },
+        Vector { a: "    y\nc\nd\nreturn 0\nc\n    y\n", b: "    y\na\nc\nd\nreturn 0\nc\nreturn 0",
+                 deleted: 1, inserted: 2, difflib_matched: 5,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,6 +1,7 @@\n     y\n+a\n c\n d\n return 0\n c\n-    y\n+return 0\n\\ No newline at end of file\n" },
+        Vector { a: "", b: "    y\n",
+                 deleted: 0, inserted: 1, difflib_matched: 0,
+                 gnu_unified: "--- a\n+++ b\n@@ -0,0 +1 @@\n+    y\n" },
+        Vector { a: "a\nreturn 0\n}\nreturn 0\nfn main()\n    x\n", b: "a\nreturn 0\n}\nreturn 0\nfn main()\n    x\n",
+                 deleted: 0, inserted: 0, difflib_matched: 6,
+                 gnu_unified: "" },
+        Vector { a: "}\nb\nc\n\nd\n}\n    x\nb\nfn main()\nreturn 0\n", b: "}\nb\nc\n\nd\n}\nb\nfn main()\nreturn 0\n",
+                 deleted: 1, inserted: 0, difflib_matched: 9,
+                 gnu_unified: "--- a\n+++ b\n@@ -4,7 +4,6 @@\n \n d\n }\n-    x\n b\n fn main()\n return 0\n" },
+        Vector { a: "b\na\n}\nb\nd\n    x\n}\nc\n", b: "b\nfn main()\n}\nb\nd\n    x\n}\n}\n",
+                 deleted: 2, inserted: 2, difflib_matched: 6,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,8 +1,8 @@\n b\n-a\n+fn main()\n }\n b\n d\n     x\n }\n-c\n+}\n" },
+        Vector { a: "return 0\na\nd\nc\nfn main()\n}\nc\n\na\n\nd\nb\n", b: "return 0\na\nd\nc\nfn main()\n}\nc\nd\na\n\nb\nb\n",
+                 deleted: 2, inserted: 2, difflib_matched: 10,
+                 gnu_unified: "--- a\n+++ b\n@@ -5,8 +5,8 @@\n fn main()\n }\n c\n-\n+d\n a\n \n-d\n+b\n b\n" },
+        Vector { a: "}\nc\n    y\nc\nfn main()\nc\n", b: "}\nc\n    y\n}\nfn main()\nc",
+                 deleted: 2, inserted: 2, difflib_matched: 4,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,6 +1,6 @@\n }\n c\n     y\n-c\n+}\n fn main()\n-c\n+c\n\\ No newline at end of file\n" },
+        Vector { a: "a\nc\n", b: "c\n    x",
+                 deleted: 1, inserted: 1, difflib_matched: 1,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,2 +1,2 @@\n-a\n c\n+    x\n\\ No newline at end of file\n" },
+        Vector { a: "return 0\nreturn 0\nfn main()\nd\n\n    x\nfn main()\n\n    y\n    x\n", b: "return 0\nfn main()\n}\n\n\n    x\nfn main()\n\n    y\n    x\n",
+                 deleted: 2, inserted: 2, difflib_matched: 8,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,7 +1,7 @@\n return 0\n-return 0\n fn main()\n-d\n+}\n+\n \n     x\n fn main()\n" },
+        Vector { a: "return 0\nreturn 0\n}\nreturn 0\nreturn 0\nreturn 0\n    x\nfn main()\nfn main()\n}\nc\n", b: "return 0\nreturn 0\nc\n    y\n}\nreturn 0\nreturn 0\nreturn 0\nreturn 0\n    x\nfn main()\nfn main()\n}\nc\n",
+                 deleted: 0, inserted: 3, difflib_matched: 11,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,9 +1,12 @@\n return 0\n return 0\n+c\n+    y\n }\n return 0\n return 0\n return 0\n+return 0\n     x\n fn main()\n fn main()\n" },
+        Vector { a: "    x\nb\nb\nd\nd\nreturn 0\n    x\n\nb\nfn main()\nfn main()\n", b: "    x\nb\nb\nd\nd\nreturn 0\n    x\n\nb\nfn main()\nfn main()\n",
+                 deleted: 0, inserted: 0, difflib_matched: 11,
+                 gnu_unified: "" },
+        Vector { a: "}\nb\n", b: "}\nb\n",
+                 deleted: 0, inserted: 0, difflib_matched: 2,
+                 gnu_unified: "" },
+        Vector { a: "a\n}\n    x\n    x\nd\nc\nreturn 0\n", b: "}\n    x\nreturn 0\nreturn 0\n    x\nd\nc\nreturn 0\n",
+                 deleted: 1, inserted: 2, difflib_matched: 6,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,6 +1,7 @@\n-a\n }\n     x\n+return 0\n+return 0\n     x\n d\n c\n" },
+        Vector { a: "    x\n    y\nreturn 0\nd\n", b: "    x\nc\na\n    y",
+                 deleted: 3, inserted: 3, difflib_matched: 1,
+                 gnu_unified: "--- a\n+++ b\n@@ -1,4 +1,4 @@\n     x\n-    y\n-return 0\n-d\n+c\n+a\n+    y\n\\ No newline at end of file\n" }]
+
+// The text a unified diff produces when applied to `a`.
+fn applied(a: Str, patch: Str) -> Str
+    if patch == ""
+        return a
+    match diffpatch.parse_unified(patch)
+        Err(_) => "<parse error>"
+        Ok(p)  =>
+            let files = p.files
+            diffpatch.apply(a, files[0], diffpatch.strict_apply_options()).text
+
+// The text a unified diff produces when applied backwards to `b`.
+fn unapplied(b: Str, patch: Str) -> Str
+    if patch == ""
+        return b
+    let o = DiffApplyOptions { fuzz: 0, max_offset: 0, reverse: true,
+                               ignore_whitespace: false, detect_already_applied: false }
+    match diffpatch.parse_unified(patch)
+        Err(_) => "<parse error>"
+        Ok(p)  =>
+            let files = p.files
+            diffpatch.apply(b, files[0], o).text
+
+@test
+fn test_the_shortest_script_has_gnu_diffs_counts() [io]
+    for v in vectors()
+        let input = diffunit.tokenize(v.a, v.b, DiffLines)
+        let c = diffscript.counts(diffscript.diff(input, diffscript.minimal_options()))
+        test.assert(c.0 == v.deleted)
+        test.assert(c.1 == v.inserted)
+
+@test
+fn test_the_common_subsequence_is_at_least_as_long_as_difflibs() [io]
+    for v in vectors()
+        let input = diffunit.tokenize(v.a, v.b, DiffLines)
+        let pairs = diffscript.common_subsequence(input.a.ids, input.b.ids,
+                                                  diffscript.minimal_options())
+        test.assert(list.len(pairs) >= v.difflib_matched)
+
+@test
+fn test_gnu_diffs_unified_output_parses_and_applies() [io]
+    for v in vectors()
+        test.assert(applied(v.a, v.gnu_unified) == v.b)
+
+@test
+fn test_every_walks_own_unified_output_applies_both_ways() [io]
+    let walks = [diffscript.minimal_options(), diffscript.patience_options(),
+                 diffscript.histogram_options()]
+    for v in vectors()
+        let input = diffunit.tokenize(v.a, v.b, DiffLines)
+        for o in walks
+            let s = diffscript.diff(input, o)
+            let text = diffrender.unified(input, s, diffrender.unified_options_named(3, "a", "b"))
+            test.assert(applied(v.a, text) == v.b)
+            test.assert(unapplied(v.b, text) == v.a)

@@ -1,0 +1,24 @@
+// roundtrip_probe.nv — prints this package's unified diff of two files,
+// for tests/patch_roundtrip.sh to hand to GNU patch.
+//
+// Usage: roundtrip_probe <left> <right> <myers|patience|histogram>
+
+use diffunit
+use diffscript
+use diffrender
+
+fn options(name: Str) -> diffscript.DiffOptions
+    if name == "patience"
+        diffscript.patience_options()
+    elif name == "histogram"
+        diffscript.histogram_options()
+    else
+        diffscript.minimal_options()
+
+fn main() [io, fs]
+    let args = env.user_args()
+    let a = fs.read(args[0]) ?? ""
+    let b = fs.read(args[1]) ?? ""
+    let input = diffunit.tokenize(a, b, DiffLines)
+    let s = diffscript.diff(input, options(args[2]))
+    print(diffrender.unified(input, s, diffrender.unified_options_named(3, "a", "b")))

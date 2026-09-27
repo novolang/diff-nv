@@ -1,0 +1,512 @@
+// edges_tests.nv — the cases each module's main suite does not reach:
+// the paper's own example, the walks' fallbacks, the policies one by
+// one, and the rarer answers of the renderer, the applier and the merge.
+//
+// The unified outputs compared byte for byte were produced by GNU
+// diffutils 3.10 (`diff -U<n> --label old --label new`) on the same two
+// files.  The Myers case is the worked example of Myers 1986, section 2,
+// whose shortest edit script has length 5.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use diffunit
+use diffscript
+use diffrender
+use diffpatch
+use diffmerge
+
+fn one(cluster: Str) -> Int
+    1
+
+fn two(cluster: Str) -> Int
+    2
+
+fn parse_or_empty(text: Str) -> diffpatch.DiffPatch
+    match diffpatch.parse_unified(text)
+        Ok(p)  => p
+        Err(_) => DiffPatch { source: "", files: [] }
+
+fn error_of(text: Str) -> Int
+    match diffpatch.parse_unified(text)
+        Ok(_)  => -1
+        Err(e) => diffpatch.error_line(e)
+
+// Every applier test below expects the whole text when all went in.
+fn applied(text: Str, patch: Str, o: diffpatch.DiffApplyOptions) -> diffpatch.DiffApplyResult
+    let p = parse_or_empty(patch)
+    let files = p.files
+    diffpatch.apply(text, files[0], o)
+
+@test
+fn test_the_papers_example_has_an_edit_distance_of_five() [io]
+    test.case("abcabba against cbabac: five edits and four matched characters")
+    let input = diffunit.tokenize("abcabba", "cbabac", DiffGraphemes)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let c = diffscript.counts(s)
+    test.assert(c.0 + c.1 == 5)
+    test.assert(list.len(diffscript.common_subsequence(input.a.ids, input.b.ids,
+                                                       diffscript.minimal_options())) == 4)
+
+    test.case("and the unbounded walk reports the steps it took")
+    test.assert(s.steps > 0)
+    test.assert(s.minimal)
+
+@test
+fn test_each_walk_tiles_the_inputs_and_patience_and_histogram_fall_back() [io]
+    let walks = [diffscript.default_options(), diffscript.patience_options(),
+                 diffscript.histogram_options(),
+                 DiffOptions { algo: DiffHistogram, max_steps: 0, max_chain: 1 }]
+    let pairs = [([1, 1, 2, 2], [2, 2, 1, 1]), ([1, 2, 3, 1, 2, 3], [3, 2, 1, 3, 2, 1]),
+                 ([5, 1, 2, 5, 3, 5], [5, 3, 5, 1, 5, 2, 5]), ([1, 2, 3], []), ([], [4, 5])]
+    for o in walks
+        for p in pairs
+            let s = diffscript.diff_ids(p.0, p.1, o)
+            var at_a = 0
+            var at_b = 0
+            for op in s.ops
+                test.assert(diffscript.op_a(op).start == at_a)
+                test.assert(diffscript.op_b(op).start == at_b)
+                at_a = diffscript.op_a(op).end
+                at_b = diffscript.op_b(op).end
+            test.assert(at_a == list.len(p.0))
+            test.assert(at_b == list.len(p.1))
+
+    test.case("histogram extends a match backwards over a token past the chain limit")
+    let back = diffscript.diff_ids([7, 7, 7, 1, 3], [0, 7, 1, 4],
+                                   DiffOptions { algo: DiffHistogram, max_steps: 0, max_chain: 2 })
+    let bc = diffscript.counts(back)
+    test.assert(bc.0 == 3)
+    test.assert(bc.1 == 2)
+
+    test.case("patience with no token unique on both sides answers Myers' script")
+    let ps = diffscript.diff_ids([1, 1, 2, 2], [2, 2, 1, 1], diffscript.patience_options())
+    let pc = diffscript.counts(ps)
+    test.assert(pc.0 + pc.1 == 4)
+
+    test.case("histogram whose every token passes the chain limit answers Myers' script")
+    let hs = diffscript.diff_ids([1, 1, 2, 2], [2, 2, 1, 1],
+                                 DiffOptions { algo: DiffHistogram, max_steps: 0, max_chain: 1 })
+    test.assert(hs.algo == DiffHistogram)
+    let hc = diffscript.counts(hs)
+    test.assert(hc.0 + hc.1 == 4)
+
+    test.case("histogram extends a match in both directions around its rarest token")
+    let he = diffscript.diff_ids([7, 7, 1, 2, 9, 3, 4, 7], [7, 1, 2, 9, 3, 4, 8, 7],
+                                 diffscript.histogram_options())
+    let ec = diffscript.counts(he)
+    test.assert(ec.0 == 1)
+    test.assert(ec.1 == 1)
+
+@test
+fn test_a_bound_spent_inside_a_snake_still_answers_a_correct_script() [io]
+    test.case("a bound of three steps ends the walk in the middle of a diagonal")
+    let o = DiffOptions { algo: DiffMyers, max_steps: 3, max_chain: 64 }
+    let s = diffscript.diff_ids([9, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 8], o)
+    test.assert(not s.minimal)
+    let c = diffscript.counts(s)
+    test.assert(c.0 == 1)
+    test.assert(c.1 == 1)
+
+    test.case("a spent Myers walk finishes with the histogram walk")
+    let m = diffscript.diff_ids([1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1],
+                                DiffOptions { algo: DiffMyers, max_steps: 2, max_chain: 64 })
+    test.assert(not m.minimal)
+    test.assert(diffscript.counts(m).0 >= 5)
+
+@test
+fn test_invert_turns_deletions_into_insertions() [io]
+    let s = diffscript.diff_ids([1, 2, 3], [1, 3, 4], diffscript.minimal_options())
+    let i = diffscript.invert(s)
+    var inserts = 0
+    var deletes = 0
+    for op in i.ops
+        match op
+            DiffInsert(_, _) =>
+                inserts = inserts + 1
+            DiffDelete(_, _) =>
+                deletes = deletes + 1
+            _                =>
+                pass
+    test.assert(inserts == 1)
+    test.assert(deletes == 1)
+
+@test
+fn test_the_policies_one_field_at_a_time() [io]
+    let fold = DiffTokenPolicy { fold_ascii_case: true, ignore_trailing_space: false,
+                                 ignore_all_space: false, ignore_blank_lines: false }
+    let trail = DiffTokenPolicy { fold_ascii_case: false, ignore_trailing_space: true,
+                                  ignore_all_space: false, ignore_blank_lines: false }
+    let blank = DiffTokenPolicy { fold_ascii_case: false, ignore_trailing_space: false,
+                                  ignore_all_space: false, ignore_blank_lines: true }
+
+    test.case("ASCII case folding makes Hello and hello one token")
+    let f = diffunit.tokenize_with("Hello\n", "hello\n", DiffLines, fold)
+    test.assert(f.a.ids[0] == f.b.ids[0])
+
+    test.case("trailing space is ignored, and leading space is not")
+    let t = diffunit.tokenize_with("a \t\n b\n", "a\nb\n", DiffLines, trail)
+    test.assert(t.a.ids[0] == t.b.ids[0])
+    test.assert(t.a.ids[1] != t.b.ids[1])
+
+    test.case("a whitespace-only line is the same token as an empty one")
+    let b = diffunit.tokenize_with("x\n  \n", "x\n\n", DiffLines, blank)
+    test.assert(b.a.ids[1] == b.b.ids[1])
+    test.assert(b.a.ids[0] != b.a.ids[1])
+
+    test.case("the same text with only a word unit is untouched by the line-only rule")
+    let w = diffunit.tokenize_with("a b", "a  b", DiffWords, blank)
+    test.assert(w.a.ids[1] != w.b.ids[1])
+
+@test
+fn test_the_edges_of_the_token_readers() [io]
+    let t = diffunit.tokenize_one("ab\ncd", DiffLines, diffunit.exact_policy())
+
+    test.case("line_of_byte past the end answers the last line")
+    test.assert(diffunit.line_of_byte(t, 99) == 2)
+
+    test.case("a word token is never unterminated, nor an index out of range")
+    let w = diffunit.tokenize_one("ab cd", DiffWords, diffunit.exact_policy())
+    test.assert(not diffunit.token_unterminated(w, 2))
+    test.assert(not diffunit.token_unterminated(t, 5))
+
+    test.case("grapheme_boundary clamps at both ends and keeps a boundary it is given")
+    test.assert(diffunit.grapheme_boundary("abc", -3) == 0)
+    test.assert(diffunit.grapheme_boundary("abc", 10) == 3)
+    test.assert(diffunit.grapheme_boundary("abc", 2) == 2)
+
+    test.case("an empty range and a negative one have no length")
+    test.assert(diffunit.range_len(DiffRange { start: 4, end: 2 }) == 0)
+
+@test
+fn test_unified_output_matches_gnu_diff_byte_for_byte() [io]
+    let a = "1\n2\n3\n4\n5\n6\n7\n8\n9\n"
+    let b = "1\n2\nthree\n4\n5\n6\n7\n8\n9\nten\n"
+    let input = diffunit.tokenize(a, b, DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("two hunks at -U2, with context, as `diff -U2` writes them")
+    let got = diffrender.unified(input, s, diffrender.unified_options_named(2, "old", "new"))
+    let want = "--- old\n+++ new\n@@ -1,5 +1,5 @@\n 1\n 2\n-3\n+three\n 4\n 5\n"
+               + "@@ -8,2 +8,3 @@\n 8\n 9\n+ten\n"
+    test.assert(got == want)
+
+    test.case("both sides without a final newline, as `diff -u` writes them")
+    let na = diffunit.tokenize("a\nb", "a\nc", DiffLines)
+    let ns = diffscript.diff(na, diffscript.minimal_options())
+    let nt = diffrender.unified(na, ns, diffrender.unified_options_named(3, "x", "y"))
+    test.assert(nt == "--- x\n+++ y\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+c\n"
+                      + "\\ No newline at end of file\n")
+
+    test.case("with the marker turned off, the line still ends")
+    var o = diffrender.unified_options(0)
+    o = DiffUnifiedOptions { context: 0, labels: o.labels, no_newline_marker: false, sections: [] }
+    test.assert(diffrender.unified(na, ns, o) == "@@ -2 +2 @@\n-b\n+c\n")
+
+    test.case("stamps are written after a tab, and sections after each @@")
+    let labels = DiffLabels { a_name: "a", b_name: "b", a_stamp: "t1", b_stamp: "t2" }
+    let so = DiffUnifiedOptions { context: 0, labels: labels, no_newline_marker: true,
+                                  sections: ["fn one"] }
+    let st = diffrender.unified(input, s, so)
+    test.assert(str.starts_with(st, "--- a\tt1\n+++ b\tt2\n@@ -3 +3 @@ fn one\n"))
+    test.assert(str.index(st, "@@ -9,0 +10 @@\n") != None)
+
+    test.case("identical inputs render nothing at all")
+    let same = diffunit.tokenize(a, a, DiffLines)
+    test.assert(diffrender.unified(same, diffscript.diff(same, diffscript.minimal_options()),
+                                   diffrender.unified_options(3)) == "")
+
+@test
+fn test_rows_for_each_kind_of_operation() [io]
+    let input = diffunit.tokenize("a\nb\nc", "a\nc\nd\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+    let rows = diffrender.lines(input, s, 3)
+    var kinds: [Str] = []
+    for r in rows
+        match r.kind
+            DiffLineContext => list.push(kinds, "c")
+            DiffLineRemoved => list.push(kinds, "-")
+            DiffLineAdded   => list.push(kinds, "+")
+            DiffLineMarker  => list.push(kinds, "m")
+    test.case("a replacement, with the marker after the left's unterminated last line")
+    test.assert(str.join(kinds, "") == "c--m++")
+
+    test.case("a pure deletion and a pure insertion around a context row")
+    let di = diffunit.tokenize("a\nb\n", "b\nc\n", DiffLines)
+    var dk: [Str] = []
+    for r in diffrender.lines(di, diffscript.diff(di, diffscript.minimal_options()), 3)
+        match r.kind
+            DiffLineContext => list.push(dk, "c")
+            DiffLineRemoved => list.push(dk, "-")
+            DiffLineAdded   => list.push(dk, "+")
+            DiffLineMarker  => list.push(dk, "m")
+    test.assert(str.join(dk, "") == "-c+")
+
+@test
+fn test_side_by_side_rows_cut_and_wrap() [io]
+    let input = diffunit.tokenize("same\nold line that is long\ngone\n",
+                                  "same\nnew\n", DiffLines)
+    let s = diffscript.diff(input, diffscript.minimal_options())
+
+    test.case("a line too wide for its column is cut and ends with an ellipsis")
+    var buf: [u8] = []
+    diffrender.side_by_side_into(buf, input, s, diffrender.column_options(8, one))
+    let text = bytes.byte_list_to_str(buf)
+    test.assert(str.index(text, "same       same\n") != None)
+    test.assert(str.index(text, "old lin… | new\n") != None)
+    test.assert(str.index(text, "gone     <\n") != None)
+
+    test.case("wrapped, the long line continues on the next row with a blank gutter")
+    let wo = DiffColumnOptions { context: 3, width: 8, gutter: " | ", cluster_width: one, wrap: true }
+    var wbuf: [u8] = []
+    diffrender.side_by_side_into(wbuf, input, s, wo)
+    let wrapped = bytes.byte_list_to_str(wbuf)
+    test.assert(str.index(wrapped, "old line | new\n") != None)
+    test.assert(str.index(wrapped, " that is\n") != None)
+
+    test.case("the width function decides the cells, so wide clusters fill a column sooner")
+    var nbuf: [u8] = []
+    diffrender.side_by_side_into(nbuf, input, s, diffrender.column_options(8, two))
+    test.assert(str.index(bytes.byte_list_to_str(nbuf), "old… | new\n") != None)
+
+    test.case("a deletion takes the left column alone")
+    let del = diffunit.tokenize("a\nb\n", "b\n", DiffLines)
+    var dbuf: [u8] = []
+    diffrender.side_by_side_into(dbuf, del, diffscript.diff(del, diffscript.minimal_options()),
+                                 diffrender.column_options(4, one))
+    test.assert(str.index(bytes.byte_list_to_str(dbuf), "a    <\nb      b\n") != None)
+
+    test.case("an insertion takes the right column alone, and a carriage return is dropped")
+    let ins = diffunit.tokenize("a\r\n", "a\r\nb\r\n", DiffLines)
+    var ibuf: [u8] = []
+    diffrender.side_by_side_into(ibuf, ins, diffscript.diff(ins, diffscript.minimal_options()),
+                                 diffrender.column_options(4, one))
+    test.assert(str.index(bytes.byte_list_to_str(ibuf), "a      a\n     > b\n") != None)
+
+@test
+fn test_the_stat_line_scales_its_bar() [io]
+    var buf: [u8] = []
+    diffrender.stat_line_into(buf, "big", 1, 200)
+    let text = bytes.byte_list_to_str(buf)
+
+    test.case("the counts are the real ones and the bar is at most sixty wide")
+    test.assert(str.index(text, " big | 201 ") != None)
+    test.assert(str.index(text, "200 insertions(+), 1 deletion(-)") != None)
+    test.assert(str.index(text, str.repeat("+", 59) + "-\n") != None)
+
+    test.case("a count of zero is left out of the summary")
+    var only: [u8] = []
+    diffrender.stat_line_into(only, "x", 0, 2)
+    test.assert(str.index(bytes.byte_list_to_str(only), " 1 file changed, 2 insertions(+)\n") != None)
+
+@test
+fn test_every_parse_error_and_its_message() [io]
+    test.case("a --- with no +++ after it")
+    test.assert(error_of("--- a\nnot plus\n") == 1)
+    test.assert(error_of("--- a") == 1)
+
+    test.case("a +++ with no --- before it")
+    test.assert(error_of("+++ b\n") == 1)
+
+    test.case("a body line with an unknown prefix")
+    test.assert(error_of("--- a\n+++ b\n@@ -1,2 +1,2 @@\n x\n*y\n") == 5)
+
+    test.case("a header with no body before the end names the header")
+    test.assert(error_of("--- a\n+++ b\n@@ -1 +1 @@\n") == 3)
+
+    test.case("a hunk cut short by the next header counts the right side")
+    match diffpatch.parse_unified("--- a\n+++ b\n@@ -1 +1,2 @@\n-x\n+y\n@@ -5 +6 @@\n")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                DiffPatchHunkCountMismatch(_, declared, counted) =>
+                    test.assert(declared == 2)
+                    test.assert(counted == 1)
+                _                                                => test.assert(false)
+
+    test.case("headers that are not @@ -l,s +l,s @@ in each of their parts")
+    test.assert(error_of("--- a\n+++ b\n@@ -x +1 @@\n") == 3)
+    test.assert(error_of("--- a\n+++ b\n@@ -1, +1 @@\n") == 3)
+    test.assert(error_of("--- a\n+++ b\n@@ -1 1 @@\n") == 3)
+    test.assert(error_of("--- a\n+++ b\n@@ -1 +1 @\n") == 3)
+
+    test.case("every error has a message that names its line")
+    let errors = [DiffPatchBadFileHeader(1), DiffPatchBadHunkHeader(2),
+                  DiffPatchHunkCountMismatch(3, 2, 1), DiffPatchBadLinePrefix(4),
+                  DiffPatchTruncated(5)]
+    for i in 0..list.len(errors)
+        let e = errors[i]
+        test.assert(str.starts_with(e.message(), "line ${i + 1}: "))
+        test.assert(diffpatch.error_line(e) == i + 1)
+    test.assert(str.len(DiffPatchNotAPatch.message()) > 0)
+    test.assert(diffpatch.error_line(DiffPatchNotAPatch) == 0)
+
+@test
+fn test_parsing_keeps_stamps_sections_markers_and_blank_context() [io]
+    let text = "diff --git a/f b/f\n--- a/f\t2026-01-01\n+++ b/f\t2026-01-02\n"
+               + "@@ -1,3 +1,3 @@ fn main\n x\n\n-y\n\\ No newline at end of file\n+Y\n"
+               + "\\ No newline at end of file\n"
+    let p = parse_or_empty(text)
+    let files = p.files
+    let fp = files[0]
+
+    test.case("the stamps come after the tab and the section after the header")
+    test.assert(fp.a_stamp == "2026-01-01")
+    test.assert(fp.b_path == "b/f")
+    let h = fp.hunks[0]
+    test.assert(str.slice(fp.source, h.section.start, h.section.end) == "fn main")
+
+    test.case("an empty line inside a hunk is an empty context line")
+    test.assert(list.len(h.lines) == 6)
+
+    test.case("the markers take the newline off the line before them on each side")
+    let r = diffpatch.apply("x\n\ny", fp, diffpatch.strict_apply_options())
+    test.assert(r.text == "x\n\nY")
+
+    test.case("the reject file writes the section, the context and the markers back")
+    var buf: [u8] = []
+    let bad = diffpatch.apply("q\n", fp, diffpatch.strict_apply_options())
+    diffpatch.reject_file_into(buf, p, fp, bad.rejects)
+    let rej = bytes.byte_list_to_str(buf)
+    test.assert(str.index(rej, "--- a/f\t2026-01-01\n") != None)
+    test.assert(str.index(rej, "@@ -1,3 +1,3 @@ fn main\n x\n \n-y\n\\ No newline at end of file\n") != None)
+
+    test.case("no rejects write nothing, and a reject index out of range is skipped")
+    var none: [u8] = []
+    diffpatch.reject_file_into(none, p, fp, [])
+    test.assert(list.len(none) == 0)
+    diffpatch.reject_file_into(none, p, fp, [DiffReject { hunk: 9, reason: DiffRejectNoMatch }])
+    test.assert(bytes.byte_list_to_str(none) == "--- a/f\t2026-01-01\n+++ b/f\t2026-01-02\n")
+
+    test.case("a marker as the first body line qualifies nothing")
+    let odd = parse_or_empty("--- a\n+++ b\n@@ -1 +1 @@\n\\ No newline at end of file\n-a\n+b\n")
+    let odd_files = odd.files
+    test.assert(diffpatch.apply("a\n", odd_files[0], diffpatch.strict_apply_options()).text == "b\n")
+
+@test
+fn test_the_rarer_answers_of_the_applier() [io]
+    test.case("a hunk found only above its stated line")
+    let up = applied("t\nx\nx\n", "--- a\n+++ b\n@@ -2 +2 @@\n-t\n+T\n", diffpatch.apply_options())
+    test.assert(up.text == "T\nx\nx\n")
+    test.assert(up.placed[0].offset == -1)
+
+    test.case("two places equally near is ambiguous, and both are named")
+    let amb = applied("a\nt\nb\nt\nc\n", "--- a\n+++ b\n@@ -3 +3 @@\n-t\n+T\n",
+                      diffpatch.apply_options())
+    match amb.rejects[0].reason
+        DiffRejectAmbiguous(at, also) =>
+            test.assert(at == 2)
+            test.assert(also == 4)
+        _                             => test.assert(false)
+
+    test.case("a hunk that lands inside the previous one overlaps it")
+    let ov = applied("a\nb\nc\n", "--- a\n+++ b\n@@ -2 +2 @@\n-b\n+B\n@@ -1,2 +1,2 @@\n a\n-B\n+X\n",
+                     diffpatch.apply_options())
+    match ov.rejects[0].reason
+        DiffRejectOverlap(h) => test.assert(h == 0)
+        _                    => test.assert(false)
+
+    test.case("ignoring whitespace matches a line whose spacing changed")
+    let loose = DiffApplyOptions { fuzz: 0, max_offset: 0, reverse: false, ignore_whitespace: true,
+                                detect_already_applied: false }
+    let sp = applied("a  b\n", "--- a\n+++ b\n@@ -1 +1 @@\n-a b\n+c\n", loose)
+    test.assert(sp.text == "c\n")
+
+    test.case("fuzz with no context to drop stops trying at once")
+    let fz = DiffApplyOptions { fuzz: 3, max_offset: 0, reverse: false, ignore_whitespace: false,
+                                detect_already_applied: false }
+    let nf = applied("a\n", "--- a\n+++ b\n@@ -1 +1 @@\n-z\n+Z\n", fz)
+    test.assert(list.len(nf.rejects) == 1)
+
+    test.case("a hunk of context alone applies and changes nothing")
+    let ctx = applied("a\nb\n", "--- a\n+++ b\n@@ -1,2 +1,2 @@\n a\n b\n", fz)
+    test.assert(ctx.text == "a\nb\n")
+
+    test.case("fewer path components than asked keeps the last one")
+    test.assert(diffpatch.strip_path("f.txt", 2) == "f.txt")
+
+@test
+fn test_a_patch_as_a_script_counts_the_lines_between_hunks() [io]
+    let p = parse_or_empty("--- a\n+++ b\n@@ -2 +2,2 @@\n-b\n+B\n+C\n@@ -6,0 +8 @@\n+end\n")
+    let files = p.files
+    let s = diffpatch.script_of(files[0])
+    test.case("an equal run before each hunk, sized from the headers")
+    let first = diffscript.op_a(s.ops[0])
+    test.assert(first.start == 0)
+    test.assert(first.end == 1)
+    let c = diffscript.counts(s)
+    test.assert(c.0 == 1)
+    test.assert(c.1 == 3)
+    test.assert(not s.minimal)
+
+    test.case("a marker line in a patch adds no line to the script")
+    let mp = parse_or_empty("--- a\n+++ b\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n")
+    let mfiles = mp.files
+    let ms = diffscript.counts(diffpatch.script_of(mfiles[0]))
+    test.assert(ms.0 == 1)
+    test.assert(ms.1 == 1)
+
+    test.case("patch_of writes a pure deletion and a pure insertion as two hunks")
+    let input = diffunit.tokenize("x\nb\nc\n", "x\nc\nd\n", DiffLines)
+    let fp = diffpatch.patch_of(input, diffscript.diff(input, diffscript.minimal_options()),
+                                "l", "r", 0)
+    test.assert(list.len(fp.hunks) == 2)
+    let r = diffpatch.apply("x\nb\nc\n", fp, diffpatch.strict_apply_options())
+    test.assert(r.text == "x\nc\nd\n")
+
+    test.case("and the marker on each side of a last line with no newline")
+    let nn = diffunit.tokenize("a\nb", "a\nc", DiffLines)
+    let np = diffpatch.patch_of(nn, diffscript.diff(nn, diffscript.minimal_options()), "l", "r", 1)
+    test.assert(str.index(np.source, "-b\n\\ No newline at end of file\n+c\n") != None)
+    test.assert(diffpatch.apply("a\nb", np, diffpatch.strict_apply_options()).text == "a\nc")
+
+@test
+fn test_the_rarer_answers_of_the_merge() [io]
+    let base = "one\ntwo\nthree\n"
+    let ours = "one\nOURS\nthree\n"
+    let theirs = "one\nTHEIRS\nthree\n"
+    let plain = diffmerge.merge_options()
+
+    test.case("favouring theirs writes theirs")
+    let ft = DiffMergeOptions { unit: DiffLines, policy: diffunit.exact_policy(),
+                                style: DiffMergeTwoSided, favor: DiffFavorTheirs, marker_size: 7,
+                                labels: plain.labels, diff: plain.diff }
+    test.assert(diffmerge.merge3(base, ours, theirs, ft).text == "one\nTHEIRS\nthree\n")
+
+    test.case("a union writes both, ours first")
+    let fu = DiffMergeOptions { unit: DiffLines, policy: diffunit.exact_policy(),
+                                style: DiffMergeTwoSided, favor: DiffFavorUnion, marker_size: 7,
+                                labels: plain.labels, diff: plain.diff }
+    test.assert(diffmerge.merge3(base, ours, theirs, fu).text == "one\nOURS\nTHEIRS\nthree\n")
+
+    test.case("zdiff3 moves the lines both sides share out of the conflict")
+    let z = diffmerge.merge3("a\nb\nc\n", "a\nX\nb2\nY\nc\n", "a\nX\nb3\nY\nc\n",
+                             diffmerge.diff3_options("B", "O", "T"))
+    test.assert(z.text == "a\nX\n<<<<<<< O\nb2\n||||||| B\nb\n=======\nb3\n>>>>>>> T\nY\nc\n")
+
+    test.case("plain diff3 keeps them inside, and an empty label writes the bare marker")
+    let d3 = DiffMergeOptions { unit: DiffLines, policy: diffunit.exact_policy(),
+                                style: DiffMergeDiff3, favor: DiffFavorNone, marker_size: 7,
+                                labels: DiffMergeLabels { base: "", ours: "", theirs: "" },
+                                diff: plain.diff }
+    let dt = diffmerge.merge3("a\n", "X\nb\n", "X\nc\n", d3)
+    test.assert(dt.text == "<<<<<<<\nX\nb\n|||||||\na\n=======\nX\nc\n>>>>>>>\n")
+
+    test.case("both sides making the same change merge it once")
+    let same = diffmerge.merge3(base, ours, ours, plain)
+    test.assert(diffmerge.clean(same))
+    test.assert(same.text == ours)
+    test.assert(same.merged == 1)
+
+    test.case("a conflict in a line with no newline starts its markers on a fresh line")
+    let nl = diffmerge.merge3("x", "y", "z", plain)
+    test.assert(nl.text == "<<<<<<< ours\ny\n=======\nz\n>>>>>>> theirs\n")
+
+    test.case("a file with no newline and no marker has no marker lines")
+    test.assert(not diffmerge.has_marker_lines("plain text", 7))
+    test.assert(diffmerge.has_marker_lines("a\n=======", 7))
+    test.assert(not diffmerge.has_marker_lines("<<<<<<<<", 7))
+
+    test.case("conflicts_only leaves out what a favour resolved")
+    test.assert(list.len(diffmerge.conflicts_only(base, ours, theirs, fu)) == 0)

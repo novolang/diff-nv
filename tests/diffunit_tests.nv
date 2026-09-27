@@ -1,13 +1,9 @@
-// diffunit_tests.nv — the tokenisers, and the bridge between the two
-// kinds of interval.
+// diffunit_tests.nv — the tokenisers, and the conversion between the
+// two kinds of interval.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
-//
-// THE ASSERTION THIS SUITE EXISTS FOR: a token's SPAN is where it sits
-// in the caller's own string, and `range_span` is the only way a token
-// index becomes a byte offset. Every unit test below is a check that
-// the two never got mixed up.
+// A token's span is where it sits in the caller's own string, and
+// `range_span` is the one way a token index becomes a byte offset.
+// Each test checks that the two are not mixed up.
 
 use std.test
 use std.list
@@ -42,7 +38,7 @@ fn test_range_span_is_the_only_bridge_between_the_two_intervals() [io]
     test.assert(s.start == 0)
     test.assert(s.end == 8)
 
-    test.case("an empty range is an insertion POINT, positioned where the range begins")
+    test.case("an empty range is an insertion point, positioned where the range begins")
     let e = diffunit.range_span(input.a, DiffRange { start: 2, end: 2 })
     test.assert(e.start == e.end)
     test.assert(e.start == 8)

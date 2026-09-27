@@ -1,21 +1,12 @@
-// diffscript_tests.nv — the tokenisers and the three walks.
+// diffscript_tests.nv — the three walks and what a script says about
+// itself.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
-// WHERE THE VECTORS COME FROM.  The edit scripts are difflib's own
-// `test_difflib` cases and the examples in Myers 1986 § 4; the
-// patience cases are the ones Bram Cohen's announcement uses and that
-// `git diff --patience` is measured against; the histogram chain limit
-// is JGit's `HistogramDiffTest`. Where two references disagree the
-// test says which one this package follows and why.
-//
-// THE FOUR ASSERTIONS THIS SUITE EXISTS FOR, above everything else:
-// the ops tile both inputs with no gap; a policy changes the ids and
-// never the spans; a bounded walk says it was bounded; and the three
-// algorithms answer DIFFERENT scripts for the same input, which is the
-// only reason to have three.
+// The suite checks that the operations tile both inputs with no gap,
+// that a policy changes the ids and never the spans, that a bounded
+// walk says it was bounded, and that patience and Myers answer
+// different scripts for input where they are known to differ.  The
+// `ratio` values are `difflib`'s own answers, and the histogram chain
+// limit is JGit's.
 
 use std.test
 use std.list
@@ -92,7 +83,7 @@ fn test_a_policy_changes_the_ids_and_never_the_spans() [io]
     let fsc = diffscript.diff(folded, diffscript.default_options())
     test.assert(diffscript.unchanged(fsc))
 
-    test.case("and the folded input still holds the ORIGINAL bytes — the spans never folded")
+    test.case("and the folded input still holds the original bytes — the spans never folded")
     test.assert(diffunit.token_str(folded.a, 0) == "a  \n")
 
 @test
@@ -147,11 +138,19 @@ fn test_the_three_algorithms_answer_different_scripts() [io]
 
 @test
 fn test_the_difflib_answers() [io]
-    test.case("ratio of qabxcd against abycdf is 0.8 — difflib's own example")
+    test.case("ratio of qabxcd against abycdf is 8/12, as difflib answers")
     let input = diffunit.tokenize("qabxcd", "abycdf", DiffGraphemes)
     let s = diffscript.diff(input, diffscript.minimal_options())
     let r = diffscript.ratio(s, 6, 6)
-    test.assert(r > 0.79 and r < 0.81)
+    test.assert(r > 0.666 and r < 0.667)
+
+    test.case("and abcd against bcde is 0.75, the example in difflib's documentation")
+    let q = diffscript.diff(diffunit.tokenize("abcd", "bcde", DiffGraphemes),
+                            diffscript.minimal_options())
+    test.assert(diffscript.ratio(q, 4, 4) == 0.75)
+
+    test.case("two empty inputs have a ratio of 1.0")
+    test.assert(diffscript.ratio(diffscript.diff_ids([], [], diffscript.minimal_options()), 0, 0) == 1.0)
 
     test.case("two identical inputs are unchanged, and that is ONE DiffEqual, not zero ops")
     let same = diffunit.tokenize("x\ny\n", "x\ny\n", DiffLines)

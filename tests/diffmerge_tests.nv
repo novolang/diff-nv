@@ -1,18 +1,9 @@
 // diffmerge_tests.nv — three inputs, one output, conflicts as values.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: diff-nv.<module>.<fn>`.
-//
-// THE VECTORS ARE git's `t6xxx` MERGE TESTS and `diff3`'s own
-// testsuite: the clean cases, the both-changed case, the add/add case,
-// and the delete/modify case that every merge implementation gets
-// wrong at least once.
-//
-// THE ASSERTION THIS SUITE EXISTS FOR: the conflicts come back as
-// values with ranges into all three inputs, and asking whether a merge
-// is clean never requires rendering it or parsing the rendering back.
-// The last case is the one that proves it matters — a file whose own
-// content contains marker lines.
+// The cases are a change on one side, changes on both sides in
+// different places, both sides changing one line, an empty base, and a
+// file whose own content holds marker lines.  Each checks the conflicts
+// as values, with ranges into all three inputs, as well as the text.
 
 use std.test
 use std.list
@@ -96,7 +87,7 @@ fn test_the_marker_styles_are_gits_three() [io]
     test.assert(str.index(two.text, "=======") != None)
     test.assert(str.index(two.text, ">>>>>>>") != None)
 
-    test.case("and does NOT write the base")
+    test.case("and does not write the base")
     test.assert(str.index(two.text, "|||||||") == None)
 
     test.case("diff3 writes the base, and the labels the caller named")
@@ -118,7 +109,7 @@ fn test_marker_size_exists_for_a_file_that_contains_markers() [io]
     let ours = "intro CHANGED\n<<<<<<< example\nbody\n"
     let theirs = "intro OTHER\n<<<<<<< example\nbody\n"
 
-    test.case("the inputs are detected as marker-carrying BEFORE the merge runs")
+    test.case("the inputs are detected as marker-carrying before the merge runs")
     test.assert(diffmerge.has_marker_lines(base, 7))
 
     test.case("and are not, at a marker size the file does not use")
@@ -156,7 +147,7 @@ fn test_favouring_a_side_resolves_the_region_and_still_records_it() [io]
     test.case("the merge counts as clean")
     test.assert(diffmerge.clean(r))
 
-    test.case("AND the region is still on the conflict list, marked resolved")
+    test.case("and the region is still on the conflict list, marked resolved")
     test.assert(list.len(r.conflicts) == 1)
     test.assert(r.conflicts[0].resolved)
 
@@ -200,15 +191,17 @@ fn test_the_buffer_form_and_the_single_conflict_renderer() [io]
     let o = diffmerge.merge_options()
 
     test.case("merge3_into appends to the caller's buffer and hands the conflicts back beside it")
-    let seed: [u8] = [35]
+    var seed: [u8] = [35]
     let out = diffmerge.merge3_into(seed, base, ours, theirs, o)
-    test.assert(out.0[0] == 35)
-    test.assert(list.len(out.1) == 1)
+    let merged = out.0
+    let conflicts = out.1
+    test.assert(merged[0] == 35)
+    test.assert(list.len(conflicts) == 1)
 
     test.case("conflict_into renders ONE conflict, for a caller writing its own resolution")
     let toks = diffmerge.merge_tokens(base, ours, theirs, o)
-    let empty: [u8] = []
-    let one = diffmerge.conflict_into(empty, out.1[0], toks.0, toks.1, toks.2, o)
+    var empty: [u8] = []
+    let one = diffmerge.conflict_into(empty, conflicts[0], toks.0, toks.1, toks.2, o)
     let text = bytes.byte_list_to_str(one)
     test.assert(str.index(text, "OURS") != None)
     test.assert(str.index(text, "THEIRS") != None)
