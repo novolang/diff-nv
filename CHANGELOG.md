@@ -5,6 +5,54 @@ All notable changes to diff-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: the
+three walks, unified and side-by-side rendering, patch parsing and
+application, and the three-way merge.
+
+### Changed, breaking
+
+- `DiffDelete` and `DiffInsert` carry both ranges, `DiffDelete(a, b)`
+  and `DiffInsert(a, b)`, with the other side's range empty at the
+  position of the change.  With one range, an insertion had no position
+  on the left, and `op_a` could not answer one.
+- `DiffTokens` gains `unit` and `policy`, the rule its ids were made
+  under.  `intern_pair` needs them to number two separately tokenised
+  inputs, and `token_unterminated` reads the unit.
+- `DiffFilePatch` gains `source`, the patch text its spans point into,
+  so `apply` can read a hunk's lines from the file patch alone.
+- `diffrender.inline_marks` takes the granularity the refinement was
+  made at, because a refined script's ranges are token indices of that
+  granularity.
+- Every function that appends to a caller's buffer takes it as a `var`
+  parameter: `unified_into`, `hunk_header_into`, `side_by_side_into`,
+  `stat_line_into`, `apply_into`, `reject_file_into`, `merge3_into` and
+  `conflict_into`.  Under the toolchain's list rule a plain parameter
+  cannot be written.
+- `DiffTokenPolicy.ignore_blank_lines` makes every whitespace-only line
+  one token.  A run of blank lines matches a run of the same length and
+  not of any length, because an equal operation covers the same number
+  of tokens on both sides.
+
+### Behaviour the interface left open
+
+- A bounded Myers walk that reaches `max_steps` finishes with the
+  histogram walk.  Patience and histogram use Myers on a region with no
+  anchor.
+- `unified_options` writes no `---` and `+++` lines when both names are
+  empty; a script with no change renders nothing.
+- `DiffPatchTruncated` is a hunk header with no body before the end of
+  the text; a body cut short is `DiffPatchHunkCountMismatch`.
+- `apply` looks for each hunk at its header's line, moved by the lines
+  earlier hunks added or removed and by the offset the previous hunk
+  was found at.  Two matches at the same distance are
+  `DiffRejectAmbiguous`.
+- `merge3` writes unchanged regions from `ours`.  A conflict's markers
+  always start on a fresh line.
+- The interface's test of `ratio` expected 0.8 for `qabxcd` against
+  `abycdf`; `difflib` answers 8/12, and the test now does too.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

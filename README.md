@@ -11,12 +11,6 @@ diffs, patch application and a three-way merge. It is built on
 [unicode-nv](https://novo-lang.org/packages/unicode-nv) for its word
 and character granularities.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 A **token** is the unit a diff compares. Whole lines is the usual
@@ -83,10 +77,7 @@ fn main() [io]
     println(diffrender.unified(input, script, diffrender.unified_options(3)))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: diff-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build it with `novo pkg build` and run the suites with `novo test`.
 
 ## What the package contains
 
@@ -115,6 +106,11 @@ costs whatever the writer costs and nothing of this package's own. A
 terminal costs `[io]`, a file costs `[fs]`, and an in-memory buffer
 costs nothing.
 
+**`diffscript.refine` then `diffrender.inline_marks` marks the changed
+words inside a changed line.** The refinement is a second diff of one
+operation's text at a finer granularity, and the marks are byte spans
+into the two inputs.
+
 **`diffrender.lines` answers rows rather than text.** Each row carries
 a kind, a line number on each side and a byte span. An editor painting
 a gutter or a `:diff` view wants this, because a context line that
@@ -140,8 +136,10 @@ whether a merge is clean without rendering anything.
    number, is the classic defect this prevents.
    `diffunit.range_span` is the only conversion.
 2. **An edit script carries no text.** Every operation holds token
-   ranges into the `DiffInput` it came from. Rendering needs both the
-   script and the input.
+   ranges into the `DiffInput` it came from, one for each side. A
+   deletion's right range and an insertion's left range are empty and
+   mark where the change sits. Rendering needs both the script and the
+   input.
 3. **A token policy changes the numbers and never the spans.**
    `ignore_space_policy` gives two tokens that differ only in
    whitespace the same number, which is what `diff -w` does. The
@@ -156,6 +154,7 @@ whether a merge is clean without rendering anything.
    `DiffOptions.max_steps` is that count, and `DiffScript.steps`
    reports what was used. The same two inputs therefore produce the
    same diff on every machine, which a time bound could not promise.
+   A walk that reaches the bound finishes with the histogram walk.
    `minimal_options()` removes the bound.
 6. **`DiffOptions.max_chain` is the histogram algorithm's limit.** JGit
    sets it to 64: a token that occurs more often than that is not used
@@ -191,7 +190,10 @@ whether a merge is clean without rendering anything.
 12. **`diffscript.ratio` is `difflib`'s similarity measure.** It is
     twice the number of matched tokens divided by the total length of
     both inputs, so it runs from 0.0 to 1.0.
-13. **`diffrender.side_by_side_into` needs a width function.** Column
+13. **A function ending in `_into` appends to the buffer it is given.**
+    The buffer is a `var` parameter, so the caller passes a `var`
+    list, and the same list comes back.
+14. **`diffrender.side_by_side_into` needs a width function.** Column
     layout has to know how many terminal cells a string occupies, and a
     `core` package cannot decide that for you.
     [unicode-nv](https://novo-lang.org/packages/unicode-nv)'s
@@ -238,17 +240,24 @@ The reference implementation for the API shape is the Rust crate
 **`similar`**: four operation variants, the algorithm as an enum,
 inline refinement as a separate call, and a three-way merge beside the
 two-way diff. Python's **`difflib`** supplies `ratio` and its opcode
-vocabulary, and cases from its `test_difflib` are in the suite.
+vocabulary.
 
-The rendered output is compared against GNU diffutils byte for byte,
-because a unified diff is an interchange format that `patch(1)` and
-`git apply` both read. GNU patch's testsuite supplies the fuzz and
-offset cases and `git apply`'s `t4xxx` tests supply the strict ones;
-the two disagree, which is why both option sets are published. The
-merge cases come from git's `t6xxx` tests and from `diff3`.
+Two programs on the test machine act as independent implementations.
+`tools/differential.py` draws sixty pairs of texts from a fixed
+sequence and records, for each, the line counts GNU `diff --minimal`
+deletes and inserts, the lines `difflib` matches, and the unified diff
+GNU `diff -U3` writes. `tests/differential_tests.nv` holds those
+answers and asserts that the unbounded Myers walk deletes and inserts
+the same counts, that its common subsequence is at least as long as
+`difflib`'s, that GNU's unified output parses and applies to give the
+right text, and that each walk's own output applies forwards and
+backwards. `tests/patch_roundtrip.sh` hands this package's output for
+the same pairs to GNU `patch` and compares the result byte for byte.
 
-The algorithms are Myers 1986, whose section 4 examples are in the
-suite, Bram Cohen's patience diff, and JGit's histogram diff.
+The algorithms are Myers 1986, whose worked example in section 2 is in
+the suite, Bram Cohen's patience diff, and JGit's histogram diff. The
+unified outputs compared byte for byte were written by GNU diffutils
+3.10.
 
 ```bash
 novo test tests/diffunit_tests.nv      #  7 tests: tokens, policies, the two intervals
@@ -256,6 +265,10 @@ novo test tests/diffscript_tests.nv    # 10 tests: the three walks and the bound
 novo test tests/diffrender_tests.nv    # 10 tests: unified output and the row list
 novo test tests/diffpatch_tests.nv     #  8 tests: parsing, offset, fuzz and rejects
 novo test tests/diffmerge_tests.nv     #  9 tests: clean merges, conflicts and markers
+novo test tests/edges_tests.nv         # 15 tests: fallbacks, policies, rarer answers
+novo test tests/differential_tests.nv  #  4 tests: against GNU diffutils and difflib
+bash tests/patch_roundtrip.sh          # 180 diffs applied by GNU patch
+bash tests/coverage.sh                 # line coverage over src/
 ```
 
 The suite asserts that a byte span and a token range cannot be
@@ -267,39 +280,6 @@ context line beginning with a minus sign is not painted as a deletion,
 that a partly applied patch answers both the text and the rejects, and
 that a merge of a file containing marker lines is not corrupted by its
 own output.
-
-The tests compile today and fail at run, each on the
-`not implemented: diff-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-Nothing is implemented. The table lists the surface an implementation
-has to fill.
-
-| Item | Implemented |
-| --- | --- |
-| `diffunit.exact_policy`, `.ignore_space_policy` | no |
-| `diffunit.tokenize`, `.tokenize_with`, `.tokenize3`, `.tokenize_one`, `.intern_pair` | no |
-| `diffunit.token_count`, `.token_span`, `.token_str`, `.token_unterminated`, `.line_of_byte` | no |
-| `diffunit.range_span`, `.span_str`, `.range_len`, `.range_empty` | no |
-| `diffunit.grapheme_boundary`, `.word_segments` | no |
-| `diffscript.default_options`, `.minimal_options`, `.patience_options`, `.histogram_options` | no |
-| `diffscript.diff`, `.diff_ids`, `.common_subsequence`, `.refine` | no |
-| `diffscript.hunks`, `.counts`, `.ratio`, `.unchanged`, `.invert` | no |
-| `diffscript.op_a`, `.op_b`, `.op_changed` | no |
-| `diffrender.unified_options`, `.unified_options_named`, `.column_options` | no |
-| `diffrender.unified`, `.unified_into`, `.unified_to`, `.hunk_header_into` | no |
-| `diffrender.lines`, `.inline_marks`, `.stat_line_into` | no |
-| `diffrender.side_by_side_into`, `.side_by_side_to` | no |
-| `diffpatch.apply_options`, `.strict_apply_options` | no |
-| `diffpatch.parse_unified`, `.error_line`, `.patch_of`, `.script_of` | no |
-| `diffpatch.apply`, `.apply_into`, `.rejects_empty`, `.reject_file_into` | no |
-| `diffpatch.strip_path`, `.file_mode` | no |
-| `diffmerge.merge_options`, `.diff3_options`, `.markers` | no |
-| `diffmerge.merge3`, `.merge3_into`, `.merge_tokens`, `.conflicts_only` | no |
-| `diffmerge.clean`, `.conflict_into`, `.has_marker_lines` | no |
 
 ## Licence
 
