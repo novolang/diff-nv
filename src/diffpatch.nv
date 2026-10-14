@@ -301,10 +301,14 @@ pub fn apply(text: Str, fp: DiffFilePatch, o: DiffApplyOptions) -> DiffApplyResu
     for hi in 0..list.len(fp.hunks)
         let h = fp.hunks[hi]
         let sides = hunk_sides(fp, h, o.reverse)
-        let start = if o.reverse
+        // A start comes straight from the header text and may be any Int.
+        // No text holds more lines than this, so a larger start names a
+        // place no hunk fits, and the sums below stay inside an Int.
+        let declared = if o.reverse
             h.b_start
         else
             h.a_start
+        let start = diffscript.min_int(declared, max_line())
         let count = if o.reverse
             h.b_count
         else
@@ -723,6 +727,11 @@ fn unterminate(var xs: [Str])
     if n > 0 and str.ends_with(xs[n - 1], "\n")
         xs[n - 1] = str.slice(xs[n - 1], 0, str.len(xs[n - 1]) - 1)
 
+// 1099511627776 — the line number past which a hunk header is read as
+// this one.
+fn max_line() -> Int
+    1099511627776
+
 // Where the hunk goes, trying each fuzz level in turn: `(status, at,
 // fuzz or other position, old, new, expected)`.  Status 1 is placed at
 // `at` with that fuzz, 2 is ambiguous between `at` and the fourth
@@ -763,7 +772,7 @@ fn search(work: [Str], want: [Str], at: Int, max_offset: Int, loose: Bool) -> (I
     (0, 0, 0)
 
 fn fits(work: [Str], want: [Str], at: Int, loose: Bool) -> Bool
-    if at < 0 or at + list.len(want) > list.len(work)
+    if at < 0 or list.len(want) > list.len(work) - at
         return false
     for k in 0..list.len(want)
         if not same_line(work[at + k], want[k], loose)
